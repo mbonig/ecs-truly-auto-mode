@@ -1,0 +1,24 @@
+{
+  "name": "APP_NAME-infra",
+  "version": "0.1.0",
+  "private": true,
+  "bin": {
+    "app": "bin/app.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "synth": "cdk synth",
+    "deploy:platform": "cdk deploy APP_NAME-platform",
+    "diff": "cdk diff"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "aws-cdk": "^2.1135.1",
+    "ts-node": "^10.9.2",
+    "typescript": "~5.7.2"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.263.0",
+    "constructs": "^10.4.2"
+  }
+}

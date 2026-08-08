@@ -1,0 +1,287 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/mbonig/ecs-truly-auto-mode/schemas/manifest.schema.json",
+  "title": "ecs-auto-mode manifest",
+  "description": "Single source of truth for the ecs-truly-auto-mode skill. Generation is a pure function of this document.",
+  "type": "object",
+  "required": ["schemaVersion", "app", "target", "analysis", "plan", "pipeline"],
+  "additionalProperties": false,
+
+  "properties": {
+    "schemaVersion": { "const": 1 },
+
+    "app": {
+      "type": "object",
+      "required": ["name", "dockerfile", "buildContext"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,63}$" },
+        "dockerfile": { "type": "string", "minLength": 1 },
+        "buildContext": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "target": {
+      "type": "object",
+      "required": ["account", "region"],
+      "additionalProperties": false,
+      "properties": {
+        "account": { "type": "string", "pattern": "^[0-9]{12}$" },
+        "region": { "type": "string", "pattern": "^[a-z]{2}(-gov)?-[a-z]+-[0-9]$" },
+        "ssmPrefix": { "type": "string", "pattern": "^/[A-Za-z0-9._/-]+$" }
+      }
+    },
+
+    "analysis": {
+      "type": "object",
+      "required": ["buildValidated", "architecture", "container", "egress"],
+      "additionalProperties": false,
+      "properties": {
+        "buildValidated": { "type": "boolean" },
+        "architecture": {
+          "allOf": [
+            { "$ref": "#/definitions/finding" },
+            { "properties": { "value": { "enum": ["ARM64", "X86_64"] } } }
+          ]
+        },
+        "container": {
+          "type": "object",
+          "required": ["port", "healthCheck"],
+          "additionalProperties": false,
+          "properties": {
+            "port": {
+              "allOf": [
+                { "$ref": "#/definitions/finding" },
+                { "properties": { "value": { "type": "integer", "minimum": 1, "maximum": 65535 } } }
+              ]
+            },
+            "healthCheck": {
+              "type": "object",
+              "required": ["type"],
+              "additionalProperties": false,
+              "properties": {
+                "type": {
+                  "allOf": [
+                    { "$ref": "#/definitions/finding" },
+                    { "properties": { "value": { "enum": ["http", "tcp"] } } }
+                  ]
+                },
+                "path": {
+                  "allOf": [
+                    { "$ref": "#/definitions/finding" },
+                    { "properties": { "value": { "type": "string", "pattern": "^/" } } }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "egress": {
+          "type": "object",
+          "required": ["classification", "awsServices", "externalHosts"],
+          "additionalProperties": false,
+          "properties": {
+            "classification": {
+              "allOf": [
+                { "$ref": "#/definitions/finding" },
+                { "properties": { "value": { "enum": ["none", "public"] } } }
+              ]
+            },
+            "awsServices": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "ecr", "ecr-docker", "logs", "secretsmanager", "ssm",
+                  "s3", "dynamodb", "sqs", "sns", "kms", "sts", "events"
+                ]
+              },
+              "uniqueItems": true
+            },
+            "externalHosts": { "type": "array", "items": { "$ref": "#/definitions/finding" } }
+          }
+        },
+        "hostnames": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "public": { "type": "array", "items": { "$ref": "#/definitions/finding" } },
+            "internal": { "type": "array", "items": { "$ref": "#/definitions/finding" } }
+          }
+        },
+        "datastores": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["kind", "evidence", "confidence"],
+            "additionalProperties": false,
+            "properties": {
+              "kind": { "enum": ["rds", "dynamodb", "elasticache", "s3", "other"] },
+              "engine": { "type": "string" },
+              "evidence": { "$ref": "#/definitions/evidenceList" },
+              "confidence": { "$ref": "#/definitions/confidence" },
+              "confirmedByUser": { "type": "boolean" },
+              "iamActions": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        },
+        "config": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "environment": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name", "value"],
+                "additionalProperties": false,
+                "properties": {
+                  "name": { "type": "string" },
+                  "value": { "type": "string" }
+                }
+              }
+            },
+            "secrets": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/secretFinding" }
+            }
+          }
+        },
+        "buildContextPaths": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+
+    "plan": {
+      "type": "object",
+      "required": ["approved", "resources"],
+      "additionalProperties": false,
+      "properties": {
+        "approved": { "type": "boolean" },
+        "resources": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "action", "reason"],
+            "additionalProperties": false,
+            "properties": {
+              "id": { "type": "string", "minLength": 1 },
+              "action": { "enum": ["create", "adopt", "skip"] },
+              "identifiers": { "type": "object", "minProperties": 1 },
+              "reason": { "type": "string", "minLength": 1 },
+              "validated": { "type": "boolean" }
+            },
+            "allOf": [
+              {
+                "description": "An adopted resource must carry the identifiers needed to import it without an environment lookup. The converse rule — that a created resource has nothing to import — lives in the consistency checks, because expressing it here yields an Ajv message ('must NOT be valid') that tells a human editing this file nothing.",
+                "if": { "properties": { "action": { "const": "adopt" } }, "required": ["action"] },
+                "then": { "required": ["identifiers"] }
+              }
+            ]
+          }
+        }
+      }
+    },
+
+    "pipeline": {
+      "type": "object",
+      "required": ["target", "branch", "pathFilter"],
+      "additionalProperties": false,
+      "properties": {
+        "target": { "enum": ["github-actions", "codepipeline"] },
+        "branch": { "type": "string", "minLength": 1 },
+        "pathFilter": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+        "roleArn": { "type": "string", "pattern": "^arn:aws[a-z-]*:iam::[0-9]{12}:role/.+" },
+        "repository": { "type": "string", "pattern": "^[^/]+/[^/]+$" },
+        "connectionArn": { "type": "string", "pattern": "^arn:aws[a-z-]*:codeconnections:" }
+      },
+      "allOf": [
+        {
+          "description": "The GitHub Actions target authenticates through an OIDC role scoped to a repository.",
+          "if": { "properties": { "target": { "const": "github-actions" } }, "required": ["target"] },
+          "then": { "required": ["repository"] }
+        }
+      ]
+    },
+
+    "generated": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "sha256"],
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string" },
+          "sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "section": { "type": "string" }
+        }
+      }
+    }
+  },
+
+  "definitions": {
+    "confidence": { "enum": ["high", "medium", "low", "conflict"] },
+
+    "evidenceList": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["file"],
+        "additionalProperties": false,
+        "properties": {
+          "file": { "type": "string", "minLength": 1 },
+          "line": { "type": "integer", "minimum": 1 },
+          "excerpt": { "type": "string" }
+        }
+      }
+    },
+
+    "secretFinding": {
+      "description": "A secret is recorded by NAME and by where its value lives — never by value. This object deliberately has no 'value' property and forbids additional properties, so a secret value cannot be recorded even by mistake.",
+      "type": "object",
+      "required": ["name", "confidence", "evidence"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "description": "The environment variable name the container reads.",
+          "type": "string",
+          "minLength": 1
+        },
+        "source": { "enum": ["secretsmanager", "ssm"] },
+        "arn": {
+          "description": "ARN of the Secrets Manager secret, or the SSM parameter name. A pointer, not a value.",
+          "type": "string"
+        },
+        "jsonKey": {
+          "description": "Key within a JSON-valued Secrets Manager secret.",
+          "type": "string"
+        },
+        "confidence": { "$ref": "#/definitions/confidence" },
+        "evidence": { "$ref": "#/definitions/evidenceList" },
+        "confirmedByUser": { "type": "boolean" }
+      }
+    },
+
+    "finding": {
+      "type": "object",
+      "required": ["value", "confidence", "evidence"],
+      "properties": {
+        "value": {},
+        "confidence": { "$ref": "#/definitions/confidence" },
+        "evidence": { "$ref": "#/definitions/evidenceList" },
+        "confirmedByUser": { "type": "boolean" },
+        "alternatives": {
+          "description": "Competing values, populated when confidence is 'conflict'.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["value", "evidence"],
+            "properties": {
+              "value": {},
+              "evidence": { "$ref": "#/definitions/evidenceList" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

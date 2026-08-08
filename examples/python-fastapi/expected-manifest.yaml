@@ -1,0 +1,206 @@
+# Expected analysis output for the python-fastapi fixture.
+#
+# Two things this fixture pins down:
+#   1. The port lives in the Dockerfile CMD, not the source — a Python-ecosystem
+#      trap that looks like an undiscoverable port if the CMD isn't read.
+#   2. boto3 calls are AWS-internal, so this stays on the isolated path even though
+#      it talks to S3 and Secrets Manager. Endpoints, not NAT.
+schemaVersion: 1
+
+app:
+  name: orders-api
+  dockerfile: Dockerfile
+  buildContext: .
+
+target:
+  account: '071128183726'
+  region: us-east-1
+  ssmPrefix: /ecs-auto-mode/orders-api
+
+analysis:
+  buildValidated: true
+
+  architecture:
+    value: X86_64
+    confidence: medium
+    confirmedByUser: true
+    evidence:
+      - file: Dockerfile
+        line: 1
+        excerpt: 'FROM python:3.12-slim'
+
+  container:
+    port:
+      value: 8000
+      confidence: high
+      evidence:
+        - file: Dockerfile
+          line: 8
+          excerpt: 'EXPOSE 8000'
+        - file: Dockerfile
+          line: 9
+          excerpt: 'CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]'
+    healthCheck:
+      type:
+        value: http
+        confidence: high
+        evidence:
+          - file: app/main.py
+            line: 7
+            excerpt: '@app.get("/healthz")'
+      path:
+        value: /healthz
+        confidence: high
+        evidence:
+          - file: app/main.py
+            line: 7
+            excerpt: '@app.get("/healthz")'
+          - file: tests/test_health.py
+            line: 10
+            excerpt: 'assert response.status_code == 200'
+
+  egress:
+    # boto3 reaches S3 and Secrets Manager, both of which have VPC endpoints. No
+    # call leaves the VPC, so this stays isolated and pays for no NAT gateway.
+    classification:
+      value: none
+      confidence: high
+      evidence:
+        - file: app/receipts.py
+          line: 9
+          excerpt: 'boto3.client("s3").put_object(...) — reachable via gateway endpoint'
+        - file: pyproject.toml
+          line: 13
+          excerpt: 'no HTTP client or third-party SDK among the dependencies'
+    awsServices:
+      - ecr
+      - ecr-docker
+      - logs
+      - s3
+      - secretsmanager
+    externalHosts: []
+
+  hostnames:
+    public: []
+    internal: []
+
+  datastores:
+    - kind: rds
+      engine: postgres
+      confidence: high
+      evidence:
+        - file: app/db.py
+          line: 8
+          excerpt: 'create_async_engine(os.environ["DATABASE_URL"], pool_size=5)'
+        - file: alembic.ini
+          excerpt: 'alembic migration config present'
+        - file: pyproject.toml
+          line: 11
+          excerpt: 'asyncpg = "^0.30"'
+      iamActions: []
+    - kind: s3
+      confidence: high
+      evidence:
+        - file: app/receipts.py
+          line: 9
+          excerpt: 'boto3.client("s3").put_object(Bucket=RECEIPTS_BUCKET, ...)'
+      iamActions:
+        - s3:PutObject
+
+  config:
+    environment:
+      - name: LOG_LEVEL
+        value: info
+    secrets:
+      # Name and pointer only. The value was never read.
+      - name: DATABASE_URL
+        source: secretsmanager
+        arn: arn:aws:secretsmanager:us-east-1:071128183726:secret:orders/db-AbC123
+        jsonKey: url
+        confidence: high
+        evidence:
+          - file: app/db.py
+            line: 8
+            excerpt: 'os.environ["DATABASE_URL"]'
+
+  buildContextPaths:
+    - app/**
+    - pyproject.toml
+    - poetry.lock
+    - alembic.ini
+
+plan:
+  approved: true
+  resources:
+    - id: vpc
+      action: create
+      reason: No existing VPC supplied
+    - id: nat-gateway
+      action: skip
+      reason: egress.classification is none — boto3 calls resolve through VPC endpoints
+    - id: vpc-endpoints
+      action: create
+      reason: Isolated subnets require endpoints for ECR, Logs, S3 and Secrets Manager
+    - id: cluster
+      action: create
+      reason: No existing cluster supplied
+    - id: ecr-repository
+      action: create
+      reason: No existing repository supplied
+    - id: load-balancer
+      action: create
+      reason: Service accepts inbound HTTP on port 8000
+    - id: target-group
+      action: create
+      reason: Required by the load balancer listener
+    - id: log-group
+      action: create
+      reason: Task logging
+    - id: task-role
+      action: create
+      reason: Required by the task definition — grants s3:PutObject on the receipts bucket
+    - id: execution-role
+      action: create
+      reason: Required to pull the image, write logs, and read the DATABASE_URL secret
+    - id: certificate
+      action: skip
+      reason: No public hostname recorded
+    - id: dns-record
+      action: skip
+      reason: No public hostname recorded
+    - id: database
+      action: adopt
+      identifiers:
+        dbInstanceIdentifier: orders-prod
+        endpointAddress: orders-prod.cabc123def45.us-east-1.rds.amazonaws.com
+        port: 5432
+        securityGroupId: sg-0db1234567890abcd
+      validated: true
+      reason: Existing RDS instance — the skill wires connectivity and never modifies it
+    - id: receipts-bucket
+      action: adopt
+      identifiers:
+        bucketName: orders-receipts-prod
+      validated: true
+      reason: Existing S3 bucket written by app/receipts.py
+    - id: codepipeline
+      action: create
+      reason: Pipeline target is codepipeline
+    - id: codeconnection
+      action: adopt
+      identifiers:
+        connectionArn: arn:aws:codeconnections:us-east-1:071128183726:connection/abcd1234-ef56-7890-abcd-ef1234567890
+      validated: true
+      reason: Connections cannot be created by CloudFormation — the OAuth handshake is manual
+
+pipeline:
+  target: codepipeline
+  branch: main
+  connectionArn: arn:aws:codeconnections:us-east-1:071128183726:connection/abcd1234-ef56-7890-abcd-ef1234567890
+  pathFilter:
+    - app/**
+    - pyproject.toml
+    - poetry.lock
+    - alembic.ini
+    - Dockerfile
+    - infra/lib/service-stack.ts

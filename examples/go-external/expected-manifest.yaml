@@ -1,0 +1,151 @@
+# Expected analysis output for the go-external fixture.
+#
+# The point of this fixture is the egress classification: one call to a third-party
+# API is the only thing forcing a NAT gateway, and the plan must name it.
+schemaVersion: 1
+
+app:
+  name: rates-api
+  dockerfile: Dockerfile
+  buildContext: .
+
+target:
+  account: '071128183726'
+  region: us-east-1
+  ssmPrefix: /ecs-auto-mode/rates-api
+
+analysis:
+  buildValidated: true
+
+  architecture:
+    # GOARCH=amd64 in the build pins the binary regardless of the alpine base image,
+    # which is stronger evidence than the base image tag.
+    value: X86_64
+    confidence: high
+    evidence:
+      - file: Dockerfile
+        line: 6
+        excerpt: 'RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/server .'
+
+  container:
+    port:
+      value: 8080
+      confidence: high
+      evidence:
+        - file: Dockerfile
+          line: 11
+          excerpt: 'EXPOSE 8080'
+        - file: main.go
+          line: 44
+          excerpt: 'log.Fatal(http.ListenAndServe(":"+port, nil))'
+    healthCheck:
+      type:
+        value: http
+        confidence: high
+        evidence:
+          - file: main.go
+            line: 42
+            excerpt: 'http.HandleFunc("/health", health)'
+      path:
+        value: /health
+        confidence: high
+        evidence:
+          - file: main.go
+            line: 42
+            excerpt: 'http.HandleFunc("/health", health)'
+          - file: main.go
+            line: 14
+            excerpt: 'w.WriteHeader(http.StatusOK)'
+
+  egress:
+    # This single call is the entire justification for a NAT gateway. Remove it and
+    # the workload runs in isolated subnets at no standing network cost.
+    classification:
+      value: public
+      confidence: high
+      evidence:
+        - file: main.go
+          line: 24
+          excerpt: 'client.Get("https://api.exchangerate.host/latest?base=USD")'
+    awsServices:
+      - ecr
+      - ecr-docker
+      - logs
+    externalHosts:
+      - value: api.exchangerate.host
+        confidence: high
+        evidence:
+          - file: main.go
+            line: 24
+            excerpt: 'client.Get("https://api.exchangerate.host/latest?base=USD")'
+
+  hostnames:
+    public: []
+    internal: []
+
+  datastores: []
+
+  config:
+    environment:
+      - name: PORT
+        value: '8080'
+    secrets: []
+
+  buildContextPaths:
+    - main.go
+    - go.mod
+    - go.sum
+
+plan:
+  approved: true
+  resources:
+    - id: vpc
+      action: create
+      reason: No existing VPC supplied
+    - id: nat-gateway
+      action: create
+      reason: egress.classification is public — required by main.go:24 (api.exchangerate.host)
+    - id: vpc-endpoints
+      action: skip
+      reason: Private subnets have NAT; interface endpoints are optional here
+    - id: cluster
+      action: create
+      reason: No existing cluster supplied
+    - id: ecr-repository
+      action: create
+      reason: No existing repository supplied
+    - id: load-balancer
+      action: create
+      reason: Service accepts inbound HTTP on port 8080
+    - id: target-group
+      action: create
+      reason: Required by the load balancer listener
+    - id: log-group
+      action: create
+      reason: Task logging
+    - id: task-role
+      action: create
+      reason: Required by the task definition
+    - id: execution-role
+      action: create
+      reason: Required to pull the image and write logs
+    - id: certificate
+      action: skip
+      reason: No public hostname recorded — listener serves HTTP only
+    - id: dns-record
+      action: skip
+      reason: No public hostname recorded
+    - id: github-oidc-role
+      action: create
+      reason: Pipeline target is github-actions
+
+pipeline:
+  target: github-actions
+  branch: main
+  repository: mbonig/rates-api
+  pathFilter:
+    - Dockerfile
+    - go.mod
+    - go.sum
+    - infra/lib/service-stack.ts
+    - main.go

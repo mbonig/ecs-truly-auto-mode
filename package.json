@@ -1,0 +1,28 @@
+{
+  "name": "ecs-truly-auto-mode",
+  "version": "0.1.0",
+  "description": "A Claude Code skill that analyzes a containerized repository and generates the ECS infrastructure and pipeline it needs",
+  "license": "MIT",
+  "author": "Matthew Bonig",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "validate:manifest": "node scripts/validate-manifest.mjs",
+    "validate:examples": "node scripts/validate-examples.mjs",
+    "lint:cfn": "cfn-lint --ignore-checks W2001 'templates/cdk/cdk.out/*.template.json'",
+    "test": "npm run validate:examples && npm run verify:pipelines && npm run verify:resume && npm run verify:fixtures",
+    "verify:pipelines": "node scripts/verify-pipeline-equivalence.mjs",
+    "derive:filter": "node scripts/derive-path-filter.mjs",
+    "generate:config": "node scripts/generate-config.mjs",
+    "verify:fixtures": "node scripts/verify-fixtures.mjs",
+    "verify:resume": "node scripts/verify-resume.mjs"
+  },
+  "devDependencies": {
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "yaml": "^2.6.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

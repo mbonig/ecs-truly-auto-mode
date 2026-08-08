@@ -1,0 +1,153 @@
+# Expected analysis output for the ambiguous fixture, BEFORE the user answers.
+#
+# This is what the manifest looks like at the point the plan is presented: three
+# findings below `high` confidence, and `plan.approved: false`. The validator
+# rejects an approved plan in this state, which is the mechanism that stops
+# generation from running on guesses.
+#
+# A run that produces `high` confidence for any of these three has failed the
+# fixture — it guessed instead of asking.
+schemaVersion: 1
+
+app:
+  name: ambiguous-api
+  dockerfile: Dockerfile
+  buildContext: .
+
+target:
+  account: '071128183726'
+  region: us-east-1
+  ssmPrefix: /ecs-auto-mode/ambiguous-api
+
+analysis:
+  buildValidated: true
+
+  architecture:
+    # No --platform, no architecture-specific tag, no downloaded binary. Nothing to
+    # infer from, so this is asked rather than assumed to be X86_64.
+    value: X86_64
+    confidence: low
+    evidence:
+      - file: Dockerfile
+        line: 1
+        excerpt: 'FROM node:22-alpine'
+
+  container:
+    port:
+      # EXPOSE 8080 against server.listen(4000). The Dockerfile is not preferred as
+      # a rule — a stale EXPOSE against a live listen() is exactly how this
+      # disagreement usually arises, and only the user knows which is current.
+      #
+      # A third value, 9090, is a separate metrics listener rather than a competing
+      # value for the same thing; it appears in the plan as a note.
+      value: 4000
+      confidence: conflict
+      evidence:
+        - file: src/index.js
+          line: 22
+          excerpt: 'server.listen(PORT, () => console.log(`api on ${PORT}`));'
+        - file: src/index.js
+          line: 4
+          excerpt: 'const PORT = 4000;'
+      alternatives:
+        - value: 8080
+          evidence:
+            - file: Dockerfile
+              line: 7
+              excerpt: 'EXPOSE 8080'
+        - value: 9090
+          evidence:
+            - file: Dockerfile
+              line: 8
+              excerpt: 'EXPOSE 9090'
+            - file: src/index.js
+              line: 25
+              excerpt: "http.createServer((_req, res) => res.end('metrics')).listen(METRICS_PORT);"
+
+    healthCheck:
+      # No health route exists anywhere. The user is offered a TCP check or asked
+      # for a path — a path is never invented.
+      type:
+        value: tcp
+        confidence: low
+        evidence:
+          - file: src/index.js
+            excerpt: 'no route matching a health-check convention is registered'
+
+  egress:
+    classification:
+      value: none
+      confidence: high
+      evidence:
+        - file: src/index.js
+          excerpt: 'only the stdlib http server; no outbound client is constructed'
+        - file: package.json
+          line: 1
+          excerpt: 'dependencies is empty'
+    awsServices:
+      - ecr
+      - ecr-docker
+      - logs
+    externalHosts: []
+
+  hostnames:
+    public: []
+    internal: []
+
+  datastores: []
+
+  config:
+    environment: []
+    secrets: []
+
+  buildContextPaths:
+    - src/**
+    - package.json
+
+plan:
+  # Blocked. Three findings are unresolved, so there is nothing to approve yet.
+  approved: false
+  resources:
+    - id: vpc
+      action: create
+      reason: No existing VPC supplied
+    - id: nat-gateway
+      action: skip
+      reason: egress.classification is none — no outbound call leaves the VPC
+    - id: vpc-endpoints
+      action: create
+      reason: Isolated subnets require interface endpoints for ECR and CloudWatch Logs
+    - id: cluster
+      action: create
+      reason: No existing cluster supplied
+    - id: ecr-repository
+      action: create
+      reason: No existing repository supplied
+    - id: load-balancer
+      action: create
+      reason: Service accepts inbound traffic — port pending user decision
+    - id: target-group
+      action: create
+      reason: Required by the load balancer listener
+    - id: log-group
+      action: create
+      reason: Task logging
+    - id: task-role
+      action: create
+      reason: Required by the task definition
+    - id: execution-role
+      action: create
+      reason: Required to pull the image and write logs
+    - id: github-oidc-role
+      action: create
+      reason: Pipeline target is github-actions
+
+pipeline:
+  target: github-actions
+  branch: main
+  repository: mbonig/ambiguous-api
+  pathFilter:
+    - Dockerfile
+    - infra/lib/service-stack.ts
+    - package.json
+    - src/**

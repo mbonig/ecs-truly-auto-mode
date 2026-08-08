@@ -1,0 +1,25 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# CDK build output. Scoped to the CDK directories on purpose — a blanket `*.js`
+# rule also swallows fixture application source, which is JavaScript by design.
+cdk.out/
+cdk.context.json
+templates/cdk/**/*.js
+templates/cdk/**/*.d.ts
+infra/**/*.js
+infra/**/*.d.ts
+templates/cdk/lib/app-config.ts
+
+.env
+.env.*
+!.env.example
+
+.DS_Store
+*.log
+npm-debug.log*
+
+worktrees/
+.idea/
+.vscode/

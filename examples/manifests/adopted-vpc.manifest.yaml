@@ -1,0 +1,245 @@
+# Example manifest: a Python/FastAPI service adopting an existing VPC and an
+# existing RDS instance, calling a third-party API. The external call forces private
+# subnets with NAT, and the plan records the file and line that forced it.
+#
+# Note the shape of the adopted VPC identifiers: subnet IDs and availability zones
+# are recorded explicitly so that `cdk synth` needs no AWS credentials.
+schemaVersion: 1
+
+app:
+  name: orders-api
+  dockerfile: docker/Dockerfile
+  buildContext: .
+
+target:
+  account: '071128183726'
+  region: us-east-1
+  ssmPrefix: /ecs-auto-mode/orders-api
+
+analysis:
+  buildValidated: true
+
+  architecture:
+    value: X86_64
+    confidence: medium
+    confirmedByUser: true
+    evidence:
+      - file: docker/Dockerfile
+        line: 1
+        excerpt: 'FROM python:3.12-slim'
+
+  container:
+    port:
+      value: 8000
+      confidence: high
+      evidence:
+        - file: docker/Dockerfile
+          line: 18
+          excerpt: 'EXPOSE 8000'
+        - file: app/main.py
+          line: 44
+          excerpt: 'uvicorn.run(app, host="0.0.0.0", port=8000)'
+    healthCheck:
+      type:
+        value: http
+        confidence: high
+        evidence:
+          - file: app/main.py
+            line: 20
+            excerpt: '@app.get("/healthz")'
+      path:
+        value: /healthz
+        confidence: high
+        evidence:
+          - file: app/main.py
+            line: 20
+            excerpt: '@app.get("/healthz")'
+          - file: tests/test_health.py
+            line: 9
+            excerpt: 'assert response.status_code == 200'
+
+  egress:
+    classification:
+      value: public
+      confidence: high
+      evidence:
+        - file: app/payments.py
+          line: 15
+          excerpt: 'httpx.post("https://api.stripe.com/v1/charges", ...)'
+    awsServices:
+      - ecr
+      - ecr-docker
+      - logs
+      - secretsmanager
+    externalHosts:
+      - value: api.stripe.com
+        confidence: high
+        evidence:
+          - file: app/payments.py
+            line: 15
+            excerpt: 'httpx.post("https://api.stripe.com/v1/charges", ...)'
+
+  hostnames:
+    public:
+      - value: orders.example.com
+        confidence: medium
+        confirmedByUser: true
+        evidence:
+          - file: README.md
+            line: 30
+            excerpt: 'Production runs at https://orders.example.com'
+    internal: []
+
+  datastores:
+    - kind: rds
+      engine: postgres
+      confidence: high
+      evidence:
+        - file: app/db.py
+          line: 6
+          excerpt: 'create_async_engine(os.environ["DATABASE_URL"])'
+        - file: alembic.ini
+          excerpt: 'alembic migration config present'
+        - file: pyproject.toml
+          line: 14
+          excerpt: 'asyncpg = "^0.30"'
+      iamActions: []
+    - kind: s3
+      confidence: high
+      evidence:
+        - file: app/receipts.py
+          line: 22
+          excerpt: 'boto3.client("s3").put_object(Bucket=RECEIPTS_BUCKET, ...)'
+      iamActions:
+        - s3:PutObject
+        - s3:GetObject
+
+  config:
+    environment:
+      - name: LOG_LEVEL
+        value: info
+    secrets:
+      - name: DATABASE_URL
+        source: secretsmanager
+        arn: arn:aws:secretsmanager:us-east-1:071128183726:secret:orders/db-AbC123
+        jsonKey: url
+        confidence: high
+        evidence:
+          - file: app/db.py
+            line: 6
+            excerpt: 'os.environ["DATABASE_URL"]'
+      - name: STRIPE_API_KEY
+        source: secretsmanager
+        arn: arn:aws:secretsmanager:us-east-1:071128183726:secret:orders/stripe-DeF456
+        confidence: high
+        evidence:
+          - file: app/payments.py
+            line: 9
+            excerpt: 'os.environ["STRIPE_API_KEY"]'
+
+  buildContextPaths:
+    - app/**
+    - pyproject.toml
+    - poetry.lock
+
+plan:
+  approved: true
+  resources:
+    - id: vpc
+      action: adopt
+      identifiers:
+        vpcId: vpc-0abc123def4567890
+        availabilityZones:
+          - us-east-1a
+          - us-east-1b
+        privateSubnetIds:
+          - subnet-0aa11bb22cc33dd44
+          - subnet-0ee55ff66aa77bb88
+        publicSubnetIds:
+          - subnet-0cc99dd00ee11ff22
+          - subnet-0ab33cd44ef55ab66
+      validated: true
+      reason: User supplied an existing VPC with NAT already provisioned
+    - id: nat-gateway
+      action: adopt
+      identifiers:
+        note: Provided by the adopted VPC's existing private subnet routing
+      validated: true
+      reason: egress.classification is public — required by the call to api.stripe.com
+    - id: vpc-endpoints
+      action: skip
+      reason: Private subnets have NAT; interface endpoints are optional here
+    - id: cluster
+      action: create
+      reason: No existing cluster supplied
+    - id: ecr-repository
+      action: create
+      reason: No existing repository supplied
+    - id: load-balancer
+      action: create
+      reason: Service accepts inbound HTTP on port 8000
+    - id: target-group
+      action: create
+      reason: Required by the load balancer listener
+    - id: log-group
+      action: create
+      reason: Task logging
+    - id: task-role
+      action: create
+      reason: Required by the task definition
+    - id: execution-role
+      action: create
+      reason: Required to pull the image, write logs, and read the two secrets
+    - id: certificate
+      action: adopt
+      identifiers:
+        certificateArn: arn:aws:acm:us-east-1:071128183726:certificate/1a2b3c4d-5e6f-7890-abcd-ef1234567890
+      validated: true
+      reason: User supplied an existing wildcard certificate for example.com
+    - id: hosted-zone
+      action: adopt
+      identifiers:
+        hostedZoneId: Z0123456789ABCDEFGHIJ
+        zoneName: example.com
+      validated: true
+      reason: Existing public hosted zone for orders.example.com
+    - id: dns-record
+      action: create
+      reason: Alias record for orders.example.com pointing at the load balancer
+    - id: database
+      action: adopt
+      identifiers:
+        dbInstanceIdentifier: orders-prod
+        endpointAddress: orders-prod.cabc123def45.us-east-1.rds.amazonaws.com
+        port: 5432
+        securityGroupId: sg-0db1234567890abcd
+      validated: true
+      reason: Existing RDS instance — the skill wires connectivity and never modifies it
+    - id: receipts-bucket
+      action: adopt
+      identifiers:
+        bucketName: orders-receipts-prod
+      validated: true
+      reason: Existing S3 bucket written by app/receipts.py
+    - id: codepipeline
+      action: create
+      reason: Pipeline target is codepipeline
+
+pipeline:
+  target: codepipeline
+  branch: main
+  connectionArn: arn:aws:codeconnections:us-east-1:071128183726:connection/abcd1234-ef56-7890-abcd-ef1234567890
+  pathFilter:
+    - app/**
+    - pyproject.toml
+    - poetry.lock
+    - docker/Dockerfile
+    - infra/lib/service-stack.ts
+
+generated:
+  - path: infra/lib/platform-stack.ts
+    sha256: a40ee72384d1a08bdd32b9944b00d2ff74931f692573a33c301714668e5b83c4
+    section: plan.resources
+  - path: infra/lib/service-stack.ts
+    sha256: 5b0cd598f946fb83b83306fc22f04a7c0368bf13c390b892d6afd638f0615924
+    section: analysis.container

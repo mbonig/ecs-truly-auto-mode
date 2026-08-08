@@ -1,0 +1,161 @@
+# Expected analysis output for the node-express fixture.
+#
+# The isolated-subnet case: no outbound call leaves the VPC, so no NAT gateway and
+# interface endpoints for exactly the three services the task actually needs.
+schemaVersion: 1
+
+app:
+  name: hello-api
+  dockerfile: Dockerfile
+  buildContext: .
+
+target:
+  account: '071128183726'
+  region: us-east-1
+  ssmPrefix: /ecs-auto-mode/hello-api
+
+analysis:
+  buildValidated: true
+
+  architecture:
+    value: ARM64
+    confidence: high
+    evidence:
+      - file: Dockerfile
+        line: 1
+        excerpt: 'FROM --platform=linux/arm64 node:22-alpine'
+
+  container:
+    port:
+      value: 8080
+      confidence: high
+      evidence:
+        - file: Dockerfile
+          line: 14
+          excerpt: 'EXPOSE 8080'
+        - file: src/server.ts
+          line: 22
+          excerpt: 'app.listen(8080, () => ...)'
+    healthCheck:
+      type:
+        value: http
+        confidence: high
+        evidence:
+          - file: src/server.ts
+            line: 11
+            excerpt: "app.get('/health', (_req, res) => res.sendStatus(200))"
+      path:
+        value: /health
+        confidence: high
+        evidence:
+          - file: src/server.ts
+            line: 11
+            excerpt: "app.get('/health', ...)"
+          - file: test/health.test.ts
+            line: 7
+            excerpt: "expect(res.status).toBe(200)"
+
+  egress:
+    # No call in this app resolves outside the VPC, so the platform stack places the
+    # service in isolated subnets and provisions no NAT gateway.
+    classification:
+      value: none
+      confidence: high
+      evidence:
+        - file: src/server.ts
+          excerpt: 'only route handlers and a logger; no outbound HTTP client'
+        - file: package.json
+          line: 12
+          excerpt: 'dependencies contain no HTTP client or third-party SDK'
+    awsServices:
+      - ecr
+      - ecr-docker
+      - logs
+    externalHosts: []
+
+  hostnames:
+    public: []
+    internal: []
+
+  datastores: []
+
+  config:
+    environment:
+      - name: LOG_LEVEL
+        value: info
+      - name: NODE_ENV
+        value: production
+    secrets: []
+
+  buildContextPaths:
+    - src/**
+    - package.json
+    - package-lock.json
+    - tsconfig.json
+
+plan:
+  approved: true
+  resources:
+    - id: vpc
+      action: create
+      reason: No existing VPC supplied
+    - id: nat-gateway
+      action: skip
+      reason: egress.classification is none — no outbound call leaves the VPC
+    - id: vpc-endpoints
+      action: create
+      reason: Isolated subnets require interface endpoints for ECR and CloudWatch Logs
+    - id: cluster
+      action: create
+      reason: No existing cluster supplied
+    - id: ecr-repository
+      action: create
+      reason: No existing repository supplied
+    - id: load-balancer
+      action: create
+      reason: Service accepts inbound HTTP on port 8080
+    - id: target-group
+      action: create
+      reason: Required by the load balancer listener
+    - id: log-group
+      action: create
+      reason: Task logging
+    - id: task-role
+      action: create
+      reason: Required by the task definition
+    - id: execution-role
+      action: create
+      reason: Required to pull the image and write logs
+    - id: certificate
+      action: skip
+      reason: No public hostname recorded — listener serves HTTP only
+    - id: dns-record
+      action: skip
+      reason: No public hostname recorded
+    - id: github-oidc-role
+      action: create
+      reason: Pipeline target is github-actions
+
+pipeline:
+  target: github-actions
+  branch: main
+  repository: mbonig/hello-api
+  roleArn: arn:aws:iam::071128183726:role/hello-api-deploy
+  pathFilter:
+    - src/**
+    - package.json
+    - package-lock.json
+    - tsconfig.json
+    - Dockerfile
+    - infra/lib/service-stack.ts
+
+generated:
+  - path: infra/lib/platform-stack.ts
+    sha256: a40ee72384d1a08bdd32b9944b00d2ff74931f692573a33c301714668e5b83c4
+    section: plan.resources
+  - path: infra/lib/service-stack.ts
+    sha256: 5b0cd598f946fb83b83306fc22f04a7c0368bf13c390b892d6afd638f0615924
+    section: analysis.container
+  - path: .github/workflows/deploy.yml
+    sha256: 9cef5a1492a22bf6cb0808463f1c6f9e744c70ccd614a27abc9c0ed608841ade
+    section: pipeline

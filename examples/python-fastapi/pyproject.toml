@@ -1,0 +1,12 @@
+[tool.poetry]
+name = "orders-api"
+version = "1.0.0"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+fastapi = "^0.115"
+uvicorn = "^0.34"
+sqlalchemy = "^2.0"
+asyncpg = "^0.30"
+alembic = "^1.14"
+boto3 = "^1.35"
