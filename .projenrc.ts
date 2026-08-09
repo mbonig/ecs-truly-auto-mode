@@ -48,11 +48,18 @@ const project = new typescript.TypeScriptProject({
   // written into the artifact, published, and tagged — and then unbumped, so no
   // commit lands on main and a release can never trigger another release.
   //
-  // The token comes from the NPM_TOKEN repository secret (projen's default name).
-  // It must be an npm *automation* token: the publish runs non-interactively, and
-  // a classic token with 2FA enabled fails there with a confusing error.
+  // Authentication is OIDC trusted publishing, not a token. The first attempt used
+  // an NPM_TOKEN and failed with `EOTP: This operation requires a one-time
+  // password` — and npm's own output in that same run warned that "npm tokens that
+  // bypass 2FA are being restricted for direct publishing". Trusted publishing
+  // removes the long-lived credential entirely: npm verifies the workflow's OIDC
+  // identity instead, so there is no secret to leak, rotate, or have expire.
+  //
+  // This requires a matching trusted publisher configured on npmjs.com for this
+  // repository and workflow file. Without it the publish is rejected.
   release: true,
   releaseToNpm: true,
+  npmTrustedPublishing: true,
   releaseTrigger: ReleaseTrigger.continuous(),
 
   // Deliberately unscoped and short: this is what someone types. `npx

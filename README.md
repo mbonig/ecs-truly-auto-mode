@@ -201,52 +201,58 @@ commits: a `feat:` title produces a minor release, anything else a patch.
 
 Two prerequisites, neither of which the workflow can solve for itself:
 
-- **`NPM_TOKEN`** as a repository secret — see below.
+- **A trusted publisher configured on npm** — see below. There is no `NPM_TOKEN`.
 - **A public repository.** npm provenance requires one; on a private repository the
   publish fails until `npmProvenance: false` is set in `.projenrc.ts`.
 
-#### Creating the npm token
+#### Authenticating to npm: trusted publishing
 
-The token must be an **automation** ("Automation" / CI) token. The publish runs
-non-interactively, and a classic *Publish* token with 2FA enabled will fail with a
-`EOTP` / "one-time password required" error that gives no hint about the cause.
-Automation tokens bypass the 2FA prompt by design, which is exactly what CI needs.
+Publishing uses **OIDC trusted publishing** rather than a long-lived token. GitHub
+mints a short-lived identity for the workflow run and npm verifies it, so there is no
+secret to leak, rotate, or have silently expire.
 
-1. Sign in at [npmjs.com](https://www.npmjs.com/) as the account that owns the
-   `@matthewbonig` scope.
-2. Open the avatar menu (top right) → **Access Tokens**, or go straight to
-   <https://www.npmjs.com/settings/matthewbonig/tokens>.
-3. Click **Generate New Token**, and pick the kind:
-   - **Granular Access Token** (preferred) — scope it as narrowly as it will go:
-     - *Expiration*: pick a date you will actually renew; npm caps these, and an
-       expired token surfaces as a failed release, not a warning.
-     - *Packages and scopes*: **Read and write**, restricted to
-       `@matthewbonig/ecs-truly-auto-mode-skill`. On the very first publish the
-       package does not exist yet, so select the `@matthewbonig` **scope** instead,
-       then narrow the token to the single package afterwards.
-     - *Organizations*: no access needed.
-   - **Classic Token** → **Automation** — simpler, never expires, but it can publish
-     *any* package the account owns. Use only if granular tokens are unavailable.
-4. Copy the token. npm shows it exactly once.
-5. In GitHub: **Settings** → **Secrets and variables** → **Actions** →
-   **New repository secret**.
-   - Name: `NPM_TOKEN` (exactly — it is the name projen's workflow reads)
-   - Secret: the token you copied
-6. Confirm it took: the secret appears under *Repository secrets* with no value shown.
+This is not merely tidier. The first release attempt here used an `NPM_TOKEN` and
+failed with:
 
-To verify before trusting a real release, run the **release** workflow manually from
-the Actions tab with **Dry run** ticked — projen's workflow exposes a
-`workflow_dispatch` input for exactly this. It exercises authentication and the build
-without publishing.
+```
+npm error code EOTP
+npm error This operation requires a one-time password.
+```
 
-If the token ever leaks, revoke it on the same npm Access Tokens page; that
-immediately invalidates it, and a new one can be added to the secret without any
-change to this repository.
+and npm's own output in that same run warned that *"npm tokens that bypass 2FA are
+being restricted for account changes and direct publishing."* Token-based CI
+publishing is on its way out.
 
-A note on the alternative: npm also supports **trusted publishing** via OIDC, which
-removes the long-lived token entirely. projen supports it (`npmTrustedPublishing`),
-but it has to be configured on the npm side against this specific repository and
-workflow first. Worth moving to later; it is not a prerequisite now.
+To configure it:
+
+1. Sign in at [npmjs.com](https://www.npmjs.com/) as the owner of the `@matthewbonig`
+   scope.
+2. Go to the package page → **Settings** → **Trusted Publisher** (for
+   `@matthewbonig/ecs-truly-auto-mode-skill`).
+3. Choose **GitHub Actions** and fill in exactly:
+   - Organization or user: `mbonig`
+   - Repository: `ecs-truly-auto-mode`
+   - Workflow filename: `release.yml`
+   - Environment: *leave empty* — the release job does not use a GitHub environment
+4. Save. The next release authenticates automatically.
+
+**Chicken-and-egg:** npm's trusted-publisher settings live on a package page, so the
+package generally has to exist first. If npm will not let you configure a publisher
+for a package that has never been published, publish once by hand —
+`npm publish --access public` from a clean checkout after `npx projen build` — then
+configure the trusted publisher and let automation take over from the next merge.
+
+To verify without publishing, run the **release** workflow from the Actions tab with
+**Dry run** ticked.
+
+#### Why the first release needed a tag
+
+projen bumps `none` when there is no prior git tag — see `isFirstRelease` in its
+`bump-version` logic — and would have published the `0.0.0` placeholder rather than a
+version derived from commit messages. A `v0.0.0` tag was created on the commit
+preceding the CLI work to give the workflow a baseline, so the first real release
+counts those commits and lands on `0.1.0`. Conventional-commit bumping behaves
+normally from there on.
 
 ## License
 
