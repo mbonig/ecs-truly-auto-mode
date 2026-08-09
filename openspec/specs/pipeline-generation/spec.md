@@ -1,7 +1,11 @@
 # pipeline-generation Specification
 
 ## Purpose
-TBD - created by archiving change ecs-truly-auto-mode. Update Purpose after archive.
+Emits a CI/CD pipeline — GitHub Actions or CodePipeline/CodeBuild, chosen by the user — that builds the image,
+pushes it to ECR tagged with the commit SHA, and rolls the service stack forward with that tag. Both targets
+implement the same deployment contract, and the push path filter is derived from what the image build actually
+reads rather than guessed.
+
 ## Requirements
 ### Requirement: Pipeline target selection
 

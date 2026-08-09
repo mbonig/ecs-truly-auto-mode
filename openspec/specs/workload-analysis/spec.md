@@ -1,7 +1,11 @@
 # workload-analysis Specification
 
 ## Purpose
-TBD - created by archiving change ecs-truly-auto-mode. Update Purpose after archive.
+Derives an evidence-backed profile of a containerized application from its Dockerfile, source, tests, and
+configuration — inbound ports and health checks, outbound calls and whether they leave the VPC, hostnames and DNS,
+datastores, and the configuration and secrets the container reads. Every inference carries the file and line that
+supports it and a confidence level, so a wrong guess is visible and correctable before any infrastructure exists.
+
 ## Requirements
 ### Requirement: Dockerfile analysis
 
