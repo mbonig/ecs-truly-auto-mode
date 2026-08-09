@@ -89,16 +89,16 @@
 
 ## 11. First publish
 
-- [ ] 11.1 Add the `NPM_TOKEN` repository secret as an npm **automation** token, and confirm the repository is public
+- [x] 11.1 Add the `NPM_TOKEN` repository secret as an npm **automation** token, and confirm the repository is public
 - [x] 11.2 Inspect `npm pack --dry-run` output by hand against the ignore rules
-- [ ] 11.3 Publish the first version manually to claim the name and establish the baseline the automation increments from
-- [ ] 11.4 Verify the published package end to end: `npx @matthewbonig/ecs-truly-auto-mode-skill install --dir <tmp>` from a clean npx cache, then confirm the installed skill's referenced paths all resolve
+- [x] 11.3 Publish the first version manually to claim the name and establish the baseline the automation increments from
+- [x] 11.4 Verify the published package end to end: `npx @matthewbonig/ecs-truly-auto-mode-skill install --dir <tmp>` from a clean npx cache, then confirm the installed skill's referenced paths all resolve
 
 ## 12. Release automation
 
 - [x] 12.1 Enable projen's release component in `.projenrc.ts`: `releaseToNpm`, a continuous trigger on `main`, public npm access, and the default `NPM_TOKEN` secret; synth and review the generated release workflow
 - [x] 12.2 Confirm provenance is enabled for the public package and that the generated workflow requests an OIDC token
 - [x] 12.3 Confirm the generated release runs the full test suite — including the packaging check and the drift check — before the publish step
-- [ ] 12.4 Verify on the first automated release: the version is published, the tag and GitHub release exist, the published version carries a provenance attestation, and **no commit was pushed to `main`**
-- [ ] 12.5 Verify the no-op path: re-running the release on an already-released commit publishes nothing and does not fail
+- [x] 12.4 Verify on the first automated release: the version is published, the tag and GitHub release exist, the published version carries a provenance attestation, and **no commit was pushed to `main`**
+- [x] 12.5 Verify the no-op path: re-running the release on an already-released commit publishes nothing and does not fail
 - [ ] 12.6 Verify the negative path by landing a commit that fails the suite: nothing is published, no tag is pushed, and the run fails
