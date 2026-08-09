@@ -23,7 +23,7 @@ jobs:
         id: setup_node_js
         uses: actions/setup-node@v6
         with:
-          node-version: 20.0.0
+          node-version: lts/*
           package-manager-cache: false
       - name: Install dependencies
         id: install_dependencies
