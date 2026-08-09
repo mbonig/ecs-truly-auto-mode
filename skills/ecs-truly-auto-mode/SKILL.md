@@ -1,6 +1,6 @@
 ---
 name: ecs-truly-auto-mode
-description: Deploys a containerized application to AWS ECS/Fargate by analyzing the repository first. Use when a user wants to deploy, ship, or host a repo with a Dockerfile on ECS or Fargate, when they ask what AWS resources their containerized app needs, or when they want infrastructure and a CI/CD pipeline generated for a container. Analyzes the Dockerfile for ports and architecture, the source for health checks, external calls, datastores and secrets, then presents a create-or-adopt resource plan and generates a two-stack CDK app plus a GitHub Actions or CodePipeline pipeline. Not for EKS, Lambda, or non-container workloads.
+description: Deploys a containerized application to AWS ECS/Fargate by analyzing the repository first. Use when a user wants to deploy, ship, or host a repo with a Dockerfile on ECS or Fargate, when they ask what AWS resources their containerized app needs, or when they want infrastructure and a CI/CD pipeline generated for a container. Analyzes the Dockerfile for ports and architecture, the source for health checks, external calls, datastores and secrets, then presents a create-or-adopt resource plan and generates a two-stack CDK app — either a plain CDK app or a projen AwsCdkTypeScriptApp — plus a GitHub Actions or CodePipeline pipeline. Not for EKS, Lambda, or non-container workloads.
 ---
 
 # ECS truly auto mode
@@ -73,8 +73,12 @@ Read [resource-catalog.md](./references/planning/resource-catalog.md) and
 [plan-presentation.md](./references/planning/plan-presentation.md).
 
 1. Derive the resource list from the findings.
-2. Ask the pipeline target — GitHub Actions or CodePipeline — since it adds
-   resources to the plan.
+2. Ask the two generation-shape questions **together** — neither depends on the
+   analysis, so asking them separately spends two rounds on one decision point:
+   - **Pipeline target** — GitHub Actions or CodePipeline. It adds resources to the plan.
+   - **Infrastructure project style** — `plain` (default) or `projen`. See
+     [iac-style.md](./references/generation/iac-style.md). Ask it; do not infer it
+     from a projen file elsewhere in the repository.
 3. Present the plan, ordered by consequence, with the egress classification and its
    evidence as the headline item.
 4. Collect create-or-adopt for each entry, and identifiers for every adopted one.
@@ -96,28 +100,34 @@ Read [resource-catalog.md](./references/planning/resource-catalog.md) and
 
 Read [manifest-schema.md](./references/manifest-schema.md) for what controls what.
 
-Emit into the target repository:
+The stacks are the same under either `infra.style`; only the scaffolding around them
+differs. Read [iac-style.md](./references/generation/iac-style.md) for the layout, the
+generation steps, and the file-ownership rules — then emit into the target repository:
 
 ```
 infra/
-  bin/app.ts              two stacks, platform and service
-  lib/config.ts           the AppConfig types
+  bin/app.ts              two stacks, platform and service   (projen: src/main.ts)
+  lib/config.ts           the AppConfig types                 (projen: src/*)
   lib/app-config.ts       generated concrete values from the manifest
   lib/platform-stack.ts   rarely changes
   lib/service-stack.ts    changes every deploy
   lib/deploy-permissions.ts
   scripts/ssm-preflight.sh
-  package.json  tsconfig.json  cdk.json
+  package.json  tsconfig.json  cdk.json    plain only — projen derives these
+  .projenrc.ts                             projen only
 ```
 
-Sources are in [`./assets/templates/cdk/`](./assets/templates/cdk/), inside this skill.
-`app-config.ts` is the projection of the manifest; everything else is copied as-is.
-The manifest JSON Schema is at
+Sources are in [`./assets/templates/cdk/`](./assets/templates/cdk/), inside this skill,
+plus [`./assets/templates/cdk-projen/`](./assets/templates/cdk-projen/) for the projen
+style. `app-config.ts` is the projection of the manifest; everything else is copied
+as-is. The manifest JSON Schema is at
 [`./assets/schemas/manifest.schema.json`](./assets/schemas/manifest.schema.json).
 
-Then verify: `npm ci && npx tsc --noEmit && npx cdk synth '**'` must succeed **with
-no AWS credentials**. If it needs credentials, something is using an environment
-lookup, and that is a bug to fix rather than to work around.
+Then verify — **with no AWS credentials**. If it needs credentials, something is
+using an environment lookup, and that is a bug to fix rather than to work around.
+
+- `plain` → `npm ci && npx tsc --noEmit && npx cdk synth '**'`
+- `projen` → `npx projen && npx projen build`
 
 **Before writing any file**, run the overwrite check — see below.
 
@@ -129,7 +139,9 @@ Read [contract.md](./references/pipeline/contract.md).
 
 Derive the path filter from the build context, dependency manifests, lockfiles, and
 the service stack source — never a guessed `src/**`. The platform stack source is
-deliberately excluded.
+deliberately excluded. Under `infra.style: projen` the service stack lives at
+`infra/src/service-stack.ts`, and `infra/.projenrc.ts` joins the filter because it
+pins the CDK version the stack is synthesized with.
 
 - **GitHub Actions** → `.github/workflows/deploy.yml` from
   [`./assets/templates/pipeline/github-actions/`](./assets/templates/pipeline/github-actions/),
@@ -162,6 +174,11 @@ Every generated file carries a header naming it as generated and the manifest
 section that controls it. Before overwriting, hash the file on disk and compare to
 the recorded `sha256`. **If it differs, show the difference and ask** — do not write.
 
+Under `infra.style: projen` this applies to `.projenrc.ts` and `src/`, but **not** to
+the files projen derives — `package.json`, `tsconfig.json`, `cdk.json`, `.gitignore`,
+`.projen/`, `package-lock.json`. Those are never written or hashed by this skill;
+hashing one would make every `npx projen` run look like a user edit.
+
 Never modify application source or the Dockerfile.
 
 ### Bias in the egress decision
@@ -181,10 +198,12 @@ Report:
 1. **What was generated** — the file list.
 2. **Deploy the platform stack first**, by hand:
    ```
-   cd infra && npm ci && npx cdk deploy <app>-platform
+   cd infra && npm ci && npx cdk deploy <app>-platform          # plain
+   cd infra && npx projen && npx projen deploy:platform         # projen
    ```
    It publishes the SSM parameters the service stack reads, so nothing works before
-   this runs.
+   this runs. Under projen, use `deploy:platform` rather than projen's own `deploy`
+   task, which would deploy the service stack too — that one belongs to the pipeline.
 3. **The service stack is deployed by the pipeline**, on push to the configured
    branch. It is not deployed by hand and not deployed by the platform stack.
 4. **What the user must do** — create secrets that don't exist yet, complete a

@@ -60,6 +60,11 @@ Not alphabetical, not by resource type. Ordered by what it costs to get wrong:
 ### Will be skipped (1)
 
   vpc-endpoints   Private subnets have NAT; interface endpoints are optional
+
+### Generated project
+
+  Pipeline    GitHub Actions, on push to main
+  Infra app   plain CDK  (projen is the alternative -- same stacks either way)
 ```
 
 ## The egress headline
@@ -98,7 +103,10 @@ seconds. "an outbound call in the payments module" is not.
 
 **Batch the questions.** Every question for a phase comes at once, ordered by
 consequence. A run that asks one question at a time across twenty resources is a
-worse experience than a wrong default.
+worse experience than a wrong default. The two generation-shape questions — pipeline
+target and [infra style](../generation/iac-style.md) — depend on nothing in the
+analysis, so they are asked together, near the end, after the decisions that cost
+money.
 
 **Say what a resource costs when it is not obvious.** NAT gateways, interface
 endpoints, and ALBs all carry standing charges. This is the one moment where

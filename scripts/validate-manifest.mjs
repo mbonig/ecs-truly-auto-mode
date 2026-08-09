@@ -20,6 +20,21 @@ import { parse as parseYaml } from 'yaml';
 const here = dirname(fileURLToPath(import.meta.url));
 const schemaPath = join(here, '..', 'schemas', 'manifest.schema.json');
 
+/**
+ * What the skill owns under `infra.style: projen`, relative to the infra project.
+ * An allowlist rather than a list of projen's outputs, because projen's output set
+ * grows with its versions — `test/tsconfig.json` and `projenrc/tsconfig.json` are
+ * both in there — and a denylist would quietly stop covering the new ones.
+ */
+const PROJEN_OWNED = ['.projenrc.ts', 'src/', 'scripts/'];
+
+/** Named for the message only: recording one of these is the interesting mistake. */
+const PROJEN_DERIVED = [
+  'package.json', 'package-lock.json', 'tsconfig.json', 'tsconfig.dev.json',
+  'cdk.json', '.gitignore', '.gitattributes', '.npmignore', '.projen',
+  'test/tsconfig.json', 'projenrc/tsconfig.json',
+];
+
 /** Cross-field invariants. Each returns an array of human-readable problems. */
 const consistencyChecks = [
   function planApprovalRequiresValidatedBuild(m) {
@@ -142,6 +157,65 @@ const consistencyChecks = [
       return [`pipeline.pathFilter omits build-context paths [${missing.join(', ')}] — changes there would silently not deploy`];
     }
     return [];
+  },
+
+  function generatedRecordsMatchProjectStyle(m) {
+    // An absent `infra` section means the plain style — see references/manifest-schema.md.
+    const style = m.infra?.style ?? 'plain';
+    const problems = [];
+
+    for (const g of m.generated ?? []) {
+      if (!g.path?.startsWith('infra/')) continue;
+      const withinInfra = g.path.slice('infra/'.length);
+
+      if (style === 'projen') {
+        const owned = PROJEN_OWNED.some((p) => withinInfra === p || withinInfra.startsWith(p));
+        if (owned) continue;
+
+        if (PROJEN_DERIVED.some((p) => withinInfra === p || withinInfra.startsWith(`${p}/`))) {
+          problems.push(`generated records "${g.path}", which projen derives from .projenrc.ts — recording a hash for it makes every "npx projen" run look like a user edit`);
+        } else if (withinInfra.startsWith('lib/') || withinInfra.startsWith('bin/')) {
+          problems.push(`generated records "${g.path}" but infra.style is "projen", which keeps its sources under src/`);
+        } else {
+          problems.push(`generated records "${g.path}", which the skill does not own under the projen style — it owns ${PROJEN_OWNED.join(', ')} only`);
+        }
+      } else if (withinInfra.startsWith('src/') || withinInfra === '.projenrc.ts') {
+        problems.push(`generated records "${g.path}" but infra.style is "plain", which keeps its sources under bin/ and lib/`);
+      }
+    }
+
+    return problems;
+  },
+
+  function pipelineFilterMatchesProjectStyle(m) {
+    const style = m.infra?.style ?? 'plain';
+    const filter = m.pipeline?.pathFilter ?? [];
+    const problems = [];
+
+    // The service stack source has to be in the filter: changing what gets deployed
+    // must trigger a deploy. Its path follows the layout the style dictates.
+    const serviceStack = style === 'projen'
+      ? 'infra/src/service-stack.ts'
+      : 'infra/lib/service-stack.ts';
+    if (!filter.includes(serviceStack)) {
+      problems.push(`pipeline.pathFilter omits "${serviceStack}" — a change to the service stack would silently not deploy`);
+    }
+
+    // .projenrc.ts pins the CDK version the service stack is synthesized with.
+    if (style === 'projen' && !filter.includes('infra/.projenrc.ts')) {
+      problems.push('pipeline.pathFilter omits "infra/.projenrc.ts" — it pins the CDK version the service stack is synthesized with');
+    }
+
+    // The platform stack is deliberately absent: this pipeline does not deploy it,
+    // and a trigger that runs a pipeline which ignores the change is worse than none.
+    const platformStack = style === 'projen'
+      ? 'infra/src/platform-stack.ts'
+      : 'infra/lib/platform-stack.ts';
+    if (filter.includes(platformStack)) {
+      problems.push(`pipeline.pathFilter includes "${platformStack}", but this pipeline does not deploy the platform stack — the run would report success while ignoring the change`);
+    }
+
+    return problems;
   },
 
   function generatedRecordsAreUnique(m) {

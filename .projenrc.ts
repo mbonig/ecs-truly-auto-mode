@@ -165,6 +165,11 @@ const verifyPipelines = project.addTask('verify:pipelines', {
   exec: 'node scripts/verify-pipeline-equivalence.mjs',
 });
 
+const verifyStyles = project.addTask('verify:styles', {
+  description: 'Assert the plain and projen infrastructure styles stay equivalent',
+  exec: 'node scripts/verify-styles.mjs',
+});
+
 const verifyResume = project.addTask('verify:resume', {
   description: 'Assert resume and incremental re-run behavior against the manifest',
   exec: 'node scripts/verify-resume.mjs',
@@ -204,7 +209,7 @@ project.addTask('generate:config', {
   receiveArgs: true,
 });
 
-for (const task of [validateExamples, verifyPipelines, verifyResume, verifyFixtures, verifyPackaging]) {
+for (const task of [validateExamples, verifyPipelines, verifyStyles, verifyResume, verifyFixtures, verifyPackaging]) {
   project.testTask.spawn(task);
 }
 

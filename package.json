@@ -36,6 +36,7 @@
     "verify:packaging": "projen verify:packaging",
     "verify:pipelines": "projen verify:pipelines",
     "verify:resume": "projen verify:resume",
+    "verify:styles": "projen verify:styles",
     "watch": "projen watch",
     "projen": "projen"
   },

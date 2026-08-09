@@ -64,6 +64,29 @@ Not covered, and not planned:
   reasons in [adopting resources](./adopting-resources.md).
 - **`--target` multi-stage builds.** The final stage is assumed to be the last
   `FROM`.
+- **Converting a generated app between project styles.** Choosing `projen` on a
+  repository that already has a plain `infra/` writes the projen layout; it does not
+  move or delete what is there. The overwrite check guards the existing files, and
+  the leftovers are yours to remove. There is no in-place conversion, in either
+  direction.
+- **Any project style beyond `plain` and `projen`.** CDK Pipelines-managed projects,
+  Python CDK, and monorepo-nested layouts are not generated.
+
+## Generating the projen style needs a network
+
+`projen` is bootstrapped with `npx projen@latest new`, so that style — and only that
+style — requires network access at generation time. In an offline environment the run
+fails at the bootstrap step rather than silently falling back to `plain`, because a
+silent fallback would generate a project the user did not pick.
+
+Two related notes:
+
+- Projen's own generated output changes between projen versions. The skill pins the
+  CDK version but not projen itself, and owns nothing projen writes, so an upgrade
+  cannot collide with the overwrite check — but it can change `infra/package.json`
+  and friends underneath you. That is projen's contract.
+- The bootstrap exits non-zero on a fresh project (it lints an empty `src/`). That is
+  expected and documented; the project files are written regardless.
 
 ## Manifest drift
 

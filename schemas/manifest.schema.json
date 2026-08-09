@@ -202,6 +202,28 @@
       ]
     },
 
+    "infra": {
+      "description": "The shape of the generated CDK project. Optional on purpose: a manifest written before this field existed describes a plain app, and reading one must not silently convert a repository to projen. Absent means style 'plain'.",
+      "type": "object",
+      "required": ["style"],
+      "additionalProperties": false,
+      "properties": {
+        "style": { "enum": ["plain", "projen"] },
+        "cdkVersion": {
+          "description": "Exact version, no range prefix — AwsCdkTypeScriptApp takes a version, not a range. Kept equal to the aws-cdk-lib floor the plain template pins.",
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+        }
+      },
+      "allOf": [
+        {
+          "description": "The projen style pins the CDK version in .projenrc.ts, so the version has to be recorded. The plain style takes it from the template's package.json and does not.",
+          "if": { "properties": { "style": { "const": "projen" } }, "required": ["style"] },
+          "then": { "required": ["cdkVersion"] }
+        }
+      ]
+    },
+
     "generated": {
       "type": "array",
       "items": {

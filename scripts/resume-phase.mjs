@@ -18,9 +18,26 @@ import { parse as parseYaml } from 'yaml';
 export const SUPPORTED_SCHEMA_VERSIONS = [1];
 
 /**
- * @returns {{phase: string, reason: string, blocked?: boolean}}
+ * The generated project's shape, read from the manifest and never re-asked.
+ *
+ * An absent `infra` section means `plain`: every manifest written before the field
+ * existed describes a plain app, and a resume must not convert a repository to
+ * projen on the strength of a missing field.
  */
-export function resumePhase(manifest, { root = '.', filesExist = defaultFilesExist } = {}) {
+export function infraStyle(manifest) {
+  return manifest?.infra?.style ?? 'plain';
+}
+
+/**
+ * @returns {{phase: string, reason: string, style: string, blocked?: boolean}}
+ */
+export function resumePhase(manifest, options = {}) {
+  // The style rides along with every answer: whichever phase the run resumes at
+  // works in the layout the manifest already committed to.
+  return { ...decidePhase(manifest, options), style: infraStyle(manifest) };
+}
+
+function decidePhase(manifest, { root = '.', filesExist = defaultFilesExist } = {}) {
   // Never reinterpret a manifest whose meaning may have changed. Stopping is the
   // only safe response to a version this build does not know.
   if (!SUPPORTED_SCHEMA_VERSIONS.includes(manifest?.schemaVersion)) {
@@ -138,6 +155,7 @@ function main() {
     console.log(JSON.stringify(result, null, 2));
   } else {
     console.log(`phase:  ${result.phase}${result.blocked ? '  (blocked — ask the user)' : ''}`);
+    console.log(`style:  ${result.style}`);
     console.log(`reason: ${result.reason}`);
   }
   process.exit(result.blocked ? 1 : 0);
