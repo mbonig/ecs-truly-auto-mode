@@ -21,6 +21,19 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repo = join(here, '..');
 const cdkDir = join(repo, 'templates', 'cdk');
 
+/**
+ * The CDK app under templates/ is a separate npm project, and synthesizing needs
+ * its dependencies. A clean checkout — which is exactly what CI is — does not have
+ * them, and the resulting failure is an opaque `npx cdk` error rather than
+ * anything that names the cause. Install them on demand instead.
+ */
+function ensureCdkDependencies() {
+  if (existsSync(join(cdkDir, 'node_modules'))) return;
+
+  console.log('Installing templates/cdk dependencies (first run in this checkout)...\n');
+  execFileSync('npm', ['ci'], { cwd: cdkDir, stdio: 'inherit' });
+}
+
 let failures = 0;
 
 function check(label, condition, detail = '') {
@@ -76,6 +89,8 @@ function typesOf(template) {
 }
 
 // ---------------------------------------------------------------------------
+
+ensureCdkDependencies();
 
 console.log('node-express — the isolated case:\n');
 {
