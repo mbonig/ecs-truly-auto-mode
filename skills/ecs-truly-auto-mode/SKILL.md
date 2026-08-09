@@ -110,8 +110,10 @@ infra/
   package.json  tsconfig.json  cdk.json
 ```
 
-Sources are in `templates/cdk/`. `app-config.ts` is the projection of the manifest;
-everything else is copied as-is.
+Sources are in [`./assets/templates/cdk/`](./assets/templates/cdk/), inside this skill.
+`app-config.ts` is the projection of the manifest; everything else is copied as-is.
+The manifest JSON Schema is at
+[`./assets/schemas/manifest.schema.json`](./assets/schemas/manifest.schema.json).
 
 Then verify: `npm ci && npx tsc --noEmit && npx cdk synth '**'` must succeed **with
 no AWS credentials**. If it needs credentials, something is using an environment
@@ -130,7 +132,8 @@ the service stack source — never a guessed `src/**`. The platform stack source
 deliberately excluded.
 
 - **GitHub Actions** → `.github/workflows/deploy.yml` from
-  `templates/pipeline/github-actions/`, plus the OIDC role in the platform stack.
+  [`./assets/templates/pipeline/github-actions/`](./assets/templates/pipeline/github-actions/),
+  plus the OIDC role in the platform stack.
 - **CodePipeline** → `CodePipelineTarget` added to the platform stack.
 
 ---

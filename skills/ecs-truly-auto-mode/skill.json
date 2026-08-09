@@ -1,0 +1,7 @@
+{
+  "name": "ecs-truly-auto-mode",
+  "assets": [
+    { "from": "templates", "to": "assets/templates" },
+    { "from": "schemas", "to": "assets/schemas" }
+  ]
+}
