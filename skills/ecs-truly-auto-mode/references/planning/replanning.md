@@ -126,6 +126,17 @@ Only regenerate files whose controlling manifest section changed — that is wha
 - `analysis.container`, `analysis.config` → service stack
 - `pipeline` → pipeline definition
 - `analysis.egress` → both stacks
+- `infra.cdkVersion`, `app.name`, `pipeline.branch` → `.projenrc.ts`, followed by
+  `npx projen` (projen style only)
+
+`app-config.ts` is an ordinary source file under both styles, so the common re-run —
+a finding changed — needs no projen run at all.
+
+**`infra.style` is not something a re-run changes on its own.** It is read from the
+manifest and not asked again. Switching styles moves every file and rewrites the
+pipeline's path filter, so treat it as an explicit request rather than drift to
+reconcile — and when the user does ask for it, say what moves before moving it.
+Nothing is converted in place.
 
 Before writing any file, run the overwrite check: hash the file on disk and compare
 against the recorded `sha256`. A mismatch means the user edited it, and the skill

@@ -151,6 +151,63 @@ const corruptions = [
     break: (m) => { m.schemaVersion = 99; },
     expect: 'schemaVersion',
   },
+  {
+    name: 'projen style hash-tracking a file projen derives',
+    base: 'projen-style',
+    break: (m) => {
+      m.generated.push({
+        path: 'infra/package.json',
+        sha256: '0'.repeat(64),
+        section: 'infra',
+      });
+    },
+    expect: 'look like a user edit',
+  },
+  {
+    name: 'projen style recording sources in the plain layout',
+    base: 'projen-style',
+    break: (m) => {
+      m.generated.find((g) => g.path === 'infra/src/service-stack.ts').path =
+        'infra/lib/service-stack.ts';
+    },
+    expect: 'keeps its sources under src/',
+  },
+  {
+    name: 'projen style whose path filter omits the project definition',
+    base: 'projen-style',
+    break: (m) => {
+      m.pipeline.pathFilter = m.pipeline.pathFilter.filter((p) => p !== 'infra/.projenrc.ts');
+    },
+    expect: 'pins the CDK version',
+  },
+  {
+    name: 'projen style whose path filter still names the plain service stack',
+    base: 'projen-style',
+    break: (m) => {
+      m.pipeline.pathFilter = m.pipeline.pathFilter
+        .filter((p) => p !== 'infra/src/service-stack.ts')
+        .concat('infra/lib/service-stack.ts');
+    },
+    expect: 'omits "infra/src/service-stack.ts"',
+  },
+  {
+    name: 'projen sources recorded against a manifest with no infra section',
+    base: 'projen-style',
+    break: (m) => { delete m.infra; },
+    expect: 'keeps its sources under bin/ and lib/',
+  },
+  {
+    name: 'path filter that would trigger a deploy on the platform stack',
+    base: 'created-vpc',
+    break: (m) => { m.pipeline.pathFilter.push('infra/lib/platform-stack.ts'); },
+    expect: 'does not deploy the platform stack',
+  },
+  {
+    name: 'projen style recorded without a pinned CDK version',
+    base: 'projen-style',
+    break: (m) => { delete m.infra.cdkVersion; },
+    expect: 'cdkVersion',
+  },
 ];
 
 function main() {

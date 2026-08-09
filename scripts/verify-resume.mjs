@@ -141,6 +141,31 @@ console.log('Resume phase from manifest state:\n');
   check('and is blocked rather than guessed past', r.blocked, true);
 }
 
+console.log('\nRecorded project style:\n');
+
+{
+  // Every manifest written before `infra` existed describes a plain app. Reading one
+  // must resolve to plain rather than failing or converting the repository.
+  const m = structuredClone(base);
+  delete m.infra;
+  const r = resumePhase(m, { filesExist: allCurrent });
+  check('a manifest with no infra section resolves to plain', r.style, 'plain');
+  check(
+    'and resumes normally rather than stopping to ask',
+    r.blocked !== true && r.phase !== 'stop',
+    true,
+  );
+}
+
+{
+  const m = structuredClone(base);
+  m.infra = { style: 'projen', cdkVersion: '2.263.0' };
+  m.generated = [];
+  const r = resumePhase(m, { filesExist: allCurrent });
+  check('a recorded projen style is carried into the resumed phase', r.style, 'projen');
+  check('and the style is not a question the resume re-asks', r.phase, 'generate');
+}
+
 console.log('\nIncremental re-analysis:\n');
 
 {

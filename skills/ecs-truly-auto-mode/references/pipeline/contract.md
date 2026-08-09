@@ -89,6 +89,12 @@ Deploy **only** the service stack:
 cdk deploy <app>-service --parameters ImageTag=<sha> --require-approval never
 ```
 
+**The pipeline never runs projen**, under either infra style. It installs with
+`npm ci` from the committed lockfile and calls `npx cdk` from `devDependencies` —
+projen writes both, then stays out of the deploy path. A pipeline that regenerated
+project files mid-deploy could change what it deploys, which is the opposite of what
+a lockfile is for.
+
 The platform stack is deliberately **not** deployed by this pipeline. It changes
 rarely, its changes are worth a human looking at, and it contains the resources whose
 accidental replacement would cause an outage. It is deployed by hand, or by a
@@ -110,7 +116,11 @@ Derived from what the image build actually reads, never guessed:
 - Every `COPY`/`ADD` source in the Dockerfile (excluding `--from=<stage>` copies)
 - The Dockerfile itself
 - Dependency manifests and lockfiles
-- The service stack source, since changing it changes what gets deployed
+- The service stack source, since changing it changes what gets deployed —
+  `infra/lib/service-stack.ts`, or `infra/src/service-stack.ts` under
+  [`infra.style: projen`](../generation/iac-style.md)
+- `infra/.projenrc.ts`, under the projen style only: it pins the CDK version the
+  service stack is synthesized with
 
 Explicitly **not** included: the platform stack source. Changing it must not trigger
 a service deploy, because this pipeline does not deploy the platform stack — a

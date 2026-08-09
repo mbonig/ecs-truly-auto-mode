@@ -286,6 +286,9 @@
           "spawn": "verify:pipelines"
         },
         {
+          "spawn": "verify:styles"
+        },
+        {
           "spawn": "verify:resume"
         },
         {
@@ -429,6 +432,15 @@
       "steps": [
         {
           "exec": "node scripts/verify-resume.mjs"
+        }
+      ]
+    },
+    "verify:styles": {
+      "name": "verify:styles",
+      "description": "Assert the plain and projen infrastructure styles stay equivalent",
+      "steps": [
+        {
+          "exec": "node scripts/verify-styles.mjs"
         }
       ]
     },

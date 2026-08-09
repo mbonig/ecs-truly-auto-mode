@@ -1,0 +1,181 @@
+# Example manifest: the same workload as created-vpc, generated in the projen style.
+# The diff against that file is the whole point — `infra`, the src/ paths, and the
+# .projenrc.ts entry in the path filter. Nothing in `analysis` or `plan` changes,
+# because the style is about who maintains the scaffolding, not what gets deployed.
+schemaVersion: 1
+
+app:
+  name: hello-api
+  dockerfile: Dockerfile
+  buildContext: .
+
+target:
+  account: '071128183726'
+  region: us-east-1
+  ssmPrefix: /ecs-auto-mode/hello-api
+
+analysis:
+  buildValidated: true
+
+  architecture:
+    value: ARM64
+    confidence: high
+    evidence:
+      - file: Dockerfile
+        line: 1
+        excerpt: 'FROM --platform=linux/arm64 node:22-alpine'
+
+  container:
+    port:
+      value: 8080
+      confidence: high
+      evidence:
+        - file: Dockerfile
+          line: 14
+          excerpt: 'EXPOSE 8080'
+        - file: src/server.ts
+          line: 22
+          excerpt: 'app.listen(8080, () => ...)'
+    healthCheck:
+      type:
+        value: http
+        confidence: high
+        evidence:
+          - file: src/server.ts
+            line: 11
+            excerpt: "app.get('/health', (_req, res) => res.sendStatus(200))"
+      path:
+        value: /health
+        confidence: high
+        evidence:
+          - file: src/server.ts
+            line: 11
+            excerpt: "app.get('/health', ...)"
+          - file: test/health.test.ts
+            line: 7
+            excerpt: "expect(res.status).toBe(200)"
+
+  egress:
+    classification:
+      value: none
+      confidence: high
+      evidence:
+        - file: src/server.ts
+          excerpt: 'only route handlers and a logger; no outbound HTTP client'
+        - file: package.json
+          line: 12
+          excerpt: 'dependencies contain no HTTP client or third-party SDK'
+    awsServices:
+      - ecr
+      - ecr-docker
+      - logs
+    externalHosts: []
+
+  hostnames:
+    public: []
+    internal: []
+
+  datastores: []
+
+  config:
+    environment:
+      - name: LOG_LEVEL
+        value: info
+      - name: NODE_ENV
+        value: production
+    secrets: []
+
+  buildContextPaths:
+    - src/**
+    - package.json
+    - package-lock.json
+    - tsconfig.json
+
+plan:
+  approved: true
+  resources:
+    - id: vpc
+      action: create
+      reason: No existing VPC supplied
+    - id: nat-gateway
+      action: skip
+      reason: egress.classification is none — no outbound call leaves the VPC
+    - id: vpc-endpoints
+      action: create
+      reason: Isolated subnets require interface endpoints for ECR and CloudWatch Logs
+    - id: cluster
+      action: create
+      reason: No existing cluster supplied
+    - id: ecr-repository
+      action: create
+      reason: No existing repository supplied
+    - id: load-balancer
+      action: create
+      reason: Service accepts inbound HTTP on port 8080
+    - id: target-group
+      action: create
+      reason: Required by the load balancer listener
+    - id: log-group
+      action: create
+      reason: Task logging
+    - id: task-role
+      action: create
+      reason: Required by the task definition
+    - id: execution-role
+      action: create
+      reason: Required to pull the image and write logs
+    - id: certificate
+      action: skip
+      reason: No public hostname recorded — listener serves HTTP only
+    - id: dns-record
+      action: skip
+      reason: No public hostname recorded
+    - id: github-oidc-role
+      action: create
+      reason: Pipeline target is github-actions
+
+pipeline:
+  target: github-actions
+  branch: main
+  repository: mbonig/hello-api
+  roleArn: arn:aws:iam::071128183726:role/hello-api-deploy
+  pathFilter:
+    - src/**
+    - package.json
+    - package-lock.json
+    - tsconfig.json
+    - Dockerfile
+    # Projen keeps its sources under src/, so the service stack lives here.
+    - infra/src/service-stack.ts
+    # .projenrc.ts pins the CDK version the service stack is synthesized with.
+    - infra/.projenrc.ts
+
+# The user asked for projen. The CDK version is pinned exactly, and equals the
+# aws-cdk-lib floor the plain template pins with the caret stripped.
+infra:
+  style: projen
+  cdkVersion: 2.263.0
+
+# Note what is *absent*: infra/package.json, infra/tsconfig.json, infra/cdk.json,
+# infra/.gitignore, infra/package-lock.json and infra/.projen/. Projen derives those
+# from .projenrc.ts, so the skill neither writes them nor records a hash for them —
+# a recorded hash would make every `npx projen` run look like a user edit.
+generated:
+  - path: infra/.projenrc.ts
+    sha256: 1c4f0f1c2f6e5cb0f4d3a7f5b0e9c8d7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1
+    section: infra
+  - path: infra/src/main.ts
+    sha256: 2d5a1e2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7
+    section: app
+  - path: infra/src/platform-stack.ts
+    sha256: a40ee72384d1a08bdd32b9944b00d2ff74931f692573a33c301714668e5b83c4
+    section: plan.resources
+  - path: infra/src/service-stack.ts
+    sha256: 5b0cd598f946fb83b83306fc22f04a7c0368bf13c390b892d6afd638f0615924
+    section: analysis.container
+  - path: infra/scripts/ssm-preflight.sh
+    sha256: 3e6b2c1d0a9f8e7d6c5b4a39281706f5e4d3c2b1a0998877665544332211ffee
+    section: target.ssmPrefix
+  - path: .github/workflows/deploy.yml
+    sha256: 9cef5a1492a22bf6cb0808463f1c6f9e744c70ccd614a27abc9c0ed608841ade
+    section: pipeline

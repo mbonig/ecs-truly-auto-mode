@@ -104,6 +104,37 @@ Only do this when you're sure — it is what tells the skill your edits are the
 starting point, and it discards the protection for those files until they change
 again.
 
+## Under the projen style
+
+The split changes shape when `infra.style` is `projen`. The skill owns `.projenrc.ts`,
+everything in `src/`, and `scripts/ssm-preflight.sh` — those work exactly as above.
+
+It owns none of what projen derives:
+
+```
+infra/package.json      infra/tsconfig.json    infra/cdk.json
+infra/.gitignore        infra/.projen/         infra/package-lock.json
+```
+
+Those never appear in `generated` and never get a recorded hash. That is deliberate:
+projen rewrites them whenever you run `npx projen`, and a hash recorded for one would
+make a run *you* did look like an edit, stalling the next generation on a diff nobody
+made.
+
+So to change any of them, change `.projenrc.ts` and re-run:
+
+```bash
+cd infra
+npx projen
+```
+
+Editing `infra/package.json` directly works right up until the next `npx projen`
+overwrites it — which is projen's contract, not something this skill imposes.
+
+Switching styles is not a conversion. A run with a different `infra.style` writes the
+other layout; nothing moves your existing `infra/` in place, and the overwrite check
+still guards every file already on disk.
+
 ## What is never touched
 
 Application source and the Dockerfile. The skill reads them and generates around

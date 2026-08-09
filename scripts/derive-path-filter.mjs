@@ -8,7 +8,7 @@
  * missed run costs an incident.
  *
  * Usage:
- *   node scripts/derive-path-filter.mjs <dockerfile> <build-context> [--json]
+ *   node scripts/derive-path-filter.mjs <dockerfile> <build-context> [--style=plain|projen] [--json]
  */
 
 import { readFileSync, existsSync, statSync } from 'node:fs';
@@ -85,7 +85,31 @@ function toGlob(source, context) {
   return path;
 }
 
-export function derivePathFilter({ dockerfilePath, buildContext, serviceStackPath, repoRoot = process.cwd() }) {
+/**
+ * Where the generated infra project keeps the files the filter cares about, per
+ * `infra.style`. Projen keeps its sources under src/ and derives the project files
+ * from .projenrc.ts, which pins the CDK version the service stack is synthesized
+ * with — so a change to it changes what gets deployed, and it belongs in the filter.
+ */
+const STYLE_PATHS = {
+  plain: { serviceStack: 'infra/lib/service-stack.ts', extra: [] },
+  projen: { serviceStack: 'infra/src/service-stack.ts', extra: ['infra/.projenrc.ts'] },
+};
+
+export function derivePathFilter({
+  dockerfilePath,
+  buildContext,
+  style = 'plain',
+  serviceStackPath,
+  repoRoot = process.cwd(),
+}) {
+  const stylePaths = STYLE_PATHS[style];
+  if (!stylePaths) {
+    throw new Error(`unknown infra style "${style}" — expected one of ${Object.keys(STYLE_PATHS).join(', ')}`);
+  }
+  // An explicit path wins, for a project that doesn't live at infra/.
+  const serviceStack = serviceStackPath ?? stylePaths.serviceStack;
+
   const dockerfile = readFileSync(dockerfilePath, 'utf8');
   const sources = parseCopySources(dockerfile);
   const filter = new Set();
@@ -127,7 +151,8 @@ export function derivePathFilter({ dockerfilePath, buildContext, serviceStackPat
   }
 
   // Changing what gets deployed must trigger a deploy.
-  if (serviceStackPath) filter.add(serviceStackPath);
+  if (serviceStack) filter.add(serviceStack);
+  for (const path of stylePaths.extra) filter.add(path);
 
   // NOTE: the platform stack is deliberately absent. This pipeline does not deploy
   // it, and a trigger that runs a pipeline which ignores the change is worse than
@@ -153,20 +178,24 @@ function dedupe(paths) {
 }
 
 function main() {
-  const [dockerfilePath, buildContext = '.', flag] = process.argv.slice(2);
+  const args = process.argv.slice(2);
+  const flags = args.filter((a) => a.startsWith('--'));
+  const [dockerfilePath, buildContext = '.'] = args.filter((a) => !a.startsWith('--'));
   if (!dockerfilePath) {
-    console.error('usage: derive-path-filter.mjs <dockerfile> [build-context] [--json]');
+    console.error('usage: derive-path-filter.mjs <dockerfile> [build-context] [--style=plain|projen] [--json]');
     process.exit(2);
   }
+
+  const style = flags.find((f) => f.startsWith('--style='))?.split('=')[1] ?? 'plain';
 
   const filter = derivePathFilter({
     dockerfilePath,
     buildContext,
-    serviceStackPath: 'infra/lib/service-stack.ts',
+    style,
     repoRoot: buildContext,
   });
 
-  if (flag === '--json') {
+  if (flags.includes('--json')) {
     console.log(JSON.stringify(filter, null, 2));
   } else {
     for (const path of filter) console.log(path);

@@ -14,6 +14,8 @@ generates infrastructure code that keeps working after the skill is gone.
 - **A CDK TypeScript app split into two stacks.** A *platform* stack (VPC, cluster,
   ECR, load balancer, roles, logging, DNS) that changes rarely, and a *service*
   stack (task definition and service, nothing else) that changes on every deploy.
+  As a plain CDK app or a projen `AwsCdkTypeScriptApp` — your choice, same stacks and
+  same synthesized template either way.
 - **A CI/CD pipeline** — GitHub Actions or CodePipeline, your choice — triggered on
   push with a path filter derived from what the image build actually reads. It
   builds, pushes to ECR tagged with the commit SHA, and rolls the service stack
@@ -161,9 +163,10 @@ npx projen build   # compile, lint, and the full suite
 npm test           # the suite on its own
 ```
 
-The suite runs the CLI tests, 15 manifest-corruption checks, 13 pipeline-equivalence
-properties, 16 resume/incremental checks, 33 fixture assertions that synthesize real
-CloudFormation and assert on what came out, and a packaging check.
+The suite runs the CLI tests, 22 manifest-corruption checks, 13 pipeline-equivalence
+properties, 5 infrastructure-style equivalence properties, 20 resume/incremental
+checks, 34 fixture assertions that synthesize real CloudFormation and assert on what
+came out, and a packaging check.
 
 The packaging check is the one worth knowing about: it packs the real tarball, installs
 from it into a temporary directory using the packed CLI, and then resolves every
