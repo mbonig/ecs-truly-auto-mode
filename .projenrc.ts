@@ -17,7 +17,17 @@ const project = new typescript.TypeScriptProject({
   defaultReleaseBranch: 'main',
   projenrcTs: true,
   packageManager: NodePackageManager.NPM,
-  minNodeVersion: '20.0.0',
+  // 20.9.0 is the first Node 20 *LTS*; 20.0.0 was never one, and claiming support
+  // for it is not something anyone verifies.
+  minNodeVersion: '20.9.0',
+
+  // Must be set explicitly: workflowNodeVersion defaults to minNodeVersion, which
+  // pinned CI to the oldest Node the package supports. projen's own task runner
+  // uses `Symbol.dispose` (Node >= 20.4), so on 20.0.0 it died evaluating a task
+  // condition — the release silently skipped its version bump and then failed on
+  // the missing dist/releasetag.txt. The floor a package supports and the Node its
+  // tooling runs on are different questions; `lts/*` can never be too old.
+  workflowNodeVersion: 'lts/*',
 
   // Pinned to 5.x deliberately. TypeScript 7 is the native rewrite and drops the
   // `ts.sys` API that ts-node 10 — which is what executes this file — depends on;
