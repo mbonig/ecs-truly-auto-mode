@@ -75,6 +75,7 @@ Code to deploy it to ECS.
 | `install [skill...]` | Install the named skills, or all of them if none are named |
 | `list` | Show what this package ships and what is installed |
 | `uninstall <skill...>` | Remove installed skills |
+| `update [skill...]` | Update the CLI, then refresh the skills it installed |
 
 | | |
 | --- | --- |
@@ -91,6 +92,58 @@ every run either way.
 An install never overwrites silently: if the skill is already there, the CLI reports
 both versions and stops until you pass `--force`. It writes only inside the skills
 directory it resolved, and never touches Claude Code settings or other skills.
+
+## Updating
+
+Every push to `main` publishes a new version, so an installed skill goes stale on its
+own. One command brings both the CLI and the skills it installed up to date:
+
+```bash
+ecs-truly-auto-mode update
+```
+
+If your installed CLI is old enough not to have `update` yet, bootstrap once with:
+
+```bash
+npx @matthewbonig/ecs-truly-auto-mode-skill@latest install --force
+```
+
+`update` upgrades itself *first*, then refreshes skills using the version it upgraded
+to — a skill's version is the package's version, so refreshing from a stale CLI would
+copy stale skills and report success. What "upgrade itself" means depends on how the
+CLI got onto your machine:
+
+| How it is installed | What `update` does |
+| --- | --- |
+| Globally (`npm install -g`) | Upgrades the global install, so the next bare `ecs-truly-auto-mode` is current too |
+| Through `npx` | Fetches the latest package for this run and changes nothing on your `PATH` |
+| As a project dependency | Leaves your `package.json` and lockfile alone — upgrade that copy with your own package manager — and fetches the latest package for the refresh |
+| From a checkout of this repository | Nothing: it makes no network call and refreshes from the working tree |
+
+| | |
+| --- | --- |
+| `--check` | Report what is out of date — the CLI and each skill — and write nothing |
+| `--no-self-update` | Refresh from this package only, with no network call |
+| `--dry-run` | Print the upgrade it would perform and the directories it would replace |
+
+It also takes `--user`, `--project`, and `--dir <path>`, which mean exactly what they
+mean for `install`.
+
+`update` is the only command that makes a network request, and the only one that can
+write outside the skills directory — it upgrades its own globally installed package.
+`--no-self-update` turns both off. A registry it cannot reach is a warning, not a
+failure: it says the check did not happen and refreshes from the package in hand.
+
+Two things it deliberately will not do:
+
+- **It never replaces a skill directory it did not install.** A directory with no
+  install record from this package is reported and left alone, and `--force` does not
+  change that. `install --force` is where an explicit overwrite belongs.
+- **It never adds a skill that is not installed.** `update` refreshes; `install` adds.
+  A target with nothing installed reports that and exits zero.
+
+Updating replaces the whole skill directory, so anything you edited by hand inside an
+installed skill does not survive it. Keep local changes outside the skill directory.
 
 ### Installing by hand
 

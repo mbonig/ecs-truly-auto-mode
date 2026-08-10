@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { makePackage, run, snapshot, tempDir } from './harness';
+import { makePackage, preinstall, run, runAsync, snapshot, startRegistry, tempDir } from './harness';
 
 const TWO_SKILLS = {
   skills: { 'skill-one': {}, 'skill-two': {} },
@@ -479,5 +479,358 @@ describe('the install record', () => {
 
     expect(result.status).toBe(0);
     expect(result.stdout).toContain('0.0.0');
+  });
+});
+
+describe('update', () => {
+  const OFFLINE = { npm_config_registry: 'http://127.0.0.1:1' };
+
+  it('replaces an outdated skill without --force', () => {
+    const pkg = makePackage({ version: '2.0.0' });
+    const target = tempDir();
+    preinstall(target, 'demo-skill', { version: '1.0.0', files: { 'stale.md': 'gone soon\n' } });
+
+    const result = run(pkg, ['update', '--no-self-update', '--dir', target]);
+
+    expect(result.status).toBe(0);
+    const record = JSON.parse(readFileSync(join(target, 'demo-skill', '.installed.json'), 'utf8'));
+    expect(record.version).toBe('2.0.0');
+    // The whole directory is replaced, so a file the new version does not ship
+    // cannot survive the update.
+    expect(existsSync(join(target, 'demo-skill', 'stale.md'))).toBe(false);
+    expect(readFileSync(join(target, 'demo-skill', 'SKILL.md'), 'utf8')).toBe('# demo-skill\n');
+  });
+
+  it('refreshes a skill that is already at the packaged version', () => {
+    const pkg = makePackage({ version: '2.0.0' });
+    const target = tempDir();
+    preinstall(target, 'demo-skill', { version: '2.0.0', files: { 'stale.md': 'gone soon\n' } });
+
+    const result = run(pkg, ['update', '--no-self-update', '--dir', target]);
+
+    expect(result.status).toBe(0);
+    expect(existsSync(join(target, 'demo-skill', 'stale.md'))).toBe(false);
+  });
+
+  it('refreshes every installed skill when none is named', () => {
+    const pkg = makePackage({ ...TWO_SKILLS, version: '2.0.0' });
+    const target = tempDir();
+    preinstall(target, 'skill-one', { version: '1.0.0' });
+    preinstall(target, 'skill-two', { version: '1.0.0' });
+
+    const result = run(pkg, ['update', '--no-self-update', '--dir', target]);
+
+    expect(result.status).toBe(0);
+    for (const name of ['skill-one', 'skill-two']) {
+      const record = JSON.parse(readFileSync(join(target, name, '.installed.json'), 'utf8'));
+      expect(record.version).toBe('2.0.0');
+    }
+  });
+
+  it('refreshes only the named skill', () => {
+    const pkg = makePackage({ ...TWO_SKILLS, version: '2.0.0' });
+    const target = tempDir();
+    preinstall(target, 'skill-one', { version: '1.0.0' });
+    preinstall(target, 'skill-two', { version: '1.0.0' });
+    const untouched = readFileSync(join(target, 'skill-two', 'SKILL.md'), 'utf8');
+
+    const result = run(pkg, ['update', 'skill-one', '--no-self-update', '--dir', target]);
+
+    expect(result.status).toBe(0);
+    expect(JSON.parse(readFileSync(join(target, 'skill-one', '.installed.json'), 'utf8')).version).toBe('2.0.0');
+    expect(JSON.parse(readFileSync(join(target, 'skill-two', '.installed.json'), 'utf8')).version).toBe('1.0.0');
+    expect(readFileSync(join(target, 'skill-two', 'SKILL.md'), 'utf8')).toBe(untouched);
+  });
+
+  it('reports an unknown skill name and writes nothing', () => {
+    const pkg = makePackage({ version: '2.0.0' });
+    const target = tempDir();
+    preinstall(target, 'demo-skill', { version: '1.0.0' });
+
+    const result = run(pkg, ['update', 'nonesuch', '--no-self-update', '--dir', target]);
+
+    expect(result.status).not.toBe(0);
+    expect(JSON.parse(readFileSync(join(target, 'demo-skill', '.installed.json'), 'utf8')).version).toBe('1.0.0');
+  });
+
+  describe('what it may replace', () => {
+    for (const force of [[], ['--force']]) {
+      const label = force.length > 0 ? ' even with --force' : '';
+
+      it(`skips a directory it did not install and updates the rest${label}`, () => {
+        const pkg = makePackage({ ...TWO_SKILLS, version: '2.0.0' });
+        const target = tempDir();
+        preinstall(target, 'skill-one', { version: '1.0.0' });
+        preinstall(target, 'skill-two', { record: 'none', files: { 'mine.md': 'hand written\n' } });
+
+        const result = run(pkg, ['update', ...force, '--no-self-update', '--dir', target]);
+
+        expect(result.status).toBe(0);
+        expect(JSON.parse(readFileSync(join(target, 'skill-one', '.installed.json'), 'utf8')).version).toBe('2.0.0');
+        expect(readFileSync(join(target, 'skill-two', 'mine.md'), 'utf8')).toBe('hand written\n');
+        expect(existsSync(join(target, 'skill-two', '.installed.json'))).toBe(false);
+        expect(result.stdout).toContain('did not install');
+      });
+
+      it(`refuses when that directory is named explicitly${label}`, () => {
+        const pkg = makePackage({ version: '2.0.0' });
+        const target = tempDir();
+        preinstall(target, 'demo-skill', { record: 'none', files: { 'mine.md': 'hand written\n' } });
+        const before = snapshot(target);
+
+        const result = run(pkg, ['update', 'demo-skill', ...force, '--no-self-update', '--dir', target]);
+
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toContain('refusing to update');
+        expect(snapshot(target)).toEqual(before);
+      });
+    }
+
+    it('leaves a skill installed by another package alone', () => {
+      const pkg = makePackage({ version: '2.0.0' });
+      const target = tempDir();
+      preinstall(target, 'demo-skill', { package: 'some-other-package', version: '1.0.0' });
+
+      const result = run(pkg, ['update', '--no-self-update', '--dir', target]);
+
+      expect(result.status).toBe(0);
+      expect(JSON.parse(readFileSync(join(target, 'demo-skill', '.installed.json'), 'utf8')).package)
+        .toBe('some-other-package');
+    });
+  });
+
+  describe('what it will not add', () => {
+    it('does not install a skill that is not installed', () => {
+      const pkg = makePackage({ ...TWO_SKILLS, version: '2.0.0' });
+      const target = tempDir();
+      preinstall(target, 'skill-one', { version: '1.0.0' });
+
+      const result = run(pkg, ['update', '--no-self-update', '--dir', target]);
+
+      expect(result.status).toBe(0);
+      expect(existsSync(join(target, 'skill-two'))).toBe(false);
+      expect(result.stdout).toContain('run `install`');
+    });
+
+    it('refuses a named skill that is not installed', () => {
+      const pkg = makePackage({ version: '2.0.0' });
+      const target = tempDir();
+
+      const result = run(pkg, ['update', 'demo-skill', '--no-self-update', '--dir', target]);
+
+      expect(result.status).not.toBe(0);
+      expect(snapshot(target)).toEqual([]);
+    });
+
+    it('reports nothing to update and exits zero', () => {
+      const pkg = makePackage({ version: '2.0.0' });
+      const target = tempDir();
+
+      const result = run(pkg, ['update', '--no-self-update', '--dir', target]);
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('Nothing to update');
+      expect(snapshot(target)).toEqual([]);
+    });
+  });
+
+  describe('--check', () => {
+    it('reports the CLI and each skill against the latest published version', async () => {
+      const registry = await startRegistry('9.9.9');
+      const pkg = makePackage({ ...TWO_SKILLS, version: '2.0.0' });
+      const parent = tempDir();
+      const target = join(parent, 'skills');
+      mkdirSync(target);
+      preinstall(target, 'skill-one', { version: '1.0.0' });
+      const before = snapshot(target);
+
+      try {
+        const result = await runAsync(pkg, ['update', '--check', '--dir', target], undefined, {
+          npm_config_registry: registry.url,
+        });
+
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain('CLI  2.0.0  — latest 9.9.9, outdated');
+        expect(result.stdout).toContain('skill-one  — installed 1.0.0, outdated');
+        expect(result.stdout).toContain('skill-two  — not installed');
+        expect(snapshot(target)).toEqual(before);
+      } finally {
+        await registry.close();
+      }
+    });
+
+    it('creates nothing, not even the destination', async () => {
+      const registry = await startRegistry('9.9.9');
+      const pkg = makePackage({ version: '2.0.0' });
+      const target = join(tempDir(), 'skills');
+
+      try {
+        const result = await runAsync(pkg, ['update', '--check', '--dir', target], undefined, {
+          npm_config_registry: registry.url,
+        });
+
+        expect(result.status).toBe(0);
+        expect(existsSync(target)).toBe(false);
+      } finally {
+        await registry.close();
+      }
+    });
+
+    it('says which comparison it made when the registry is not consulted', () => {
+      const pkg = makePackage({ version: '2.0.0' });
+      const target = tempDir();
+      preinstall(target, 'demo-skill', { version: '1.0.0' });
+
+      const result = run(pkg, ['update', '--check', '--no-self-update', '--dir', target], undefined, OFFLINE);
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('not checked for a newer version');
+      expect(result.stdout).toContain('compared against 2.0.0');
+      expect(result.stdout).not.toContain('up to date\n\nSkills');
+    });
+  });
+
+  describe('--dry-run', () => {
+    it('prints the hand-off it would perform and changes nothing', async () => {
+      const registry = await startRegistry('9.9.9');
+      const pkg = makePackage({ version: '2.0.0' });
+      const target = tempDir();
+      preinstall(target, 'demo-skill', { version: '1.0.0' });
+      const before = snapshot(target);
+
+      try {
+        const result = await runAsync(pkg, ['update', '--dry-run', '--dir', target], undefined, {
+          npm_config_registry: registry.url,
+        });
+
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain('running 2.0.0, latest 9.9.9');
+        expect(result.stdout).toContain('would run  npx');
+        // The command it prints is the one it would run — including the flag
+        // that stops the newer version handing off again.
+        expect(result.stdout).toContain('--no-self-update --dry-run');
+        expect(result.stdout).toContain(`replace  ${join(target, 'demo-skill')}`);
+        expect(snapshot(target)).toEqual(before);
+      } finally {
+        await registry.close();
+      }
+    });
+
+    it('names what it would skip', () => {
+      const pkg = makePackage({ ...TWO_SKILLS, version: '2.0.0' });
+      const target = tempDir();
+      preinstall(target, 'skill-one', { record: 'none' });
+      const before = snapshot(target);
+
+      const result = run(pkg, ['update', '--dry-run', '--no-self-update', '--dir', target]);
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain('did not install');
+      expect(result.stdout).toContain('not installed; run `install`');
+      expect(snapshot(target)).toEqual(before);
+    });
+  });
+
+  it('warns and refreshes from this package when the registry cannot be reached', () => {
+    const pkg = makePackage({ version: '2.0.0' });
+    const target = tempDir();
+    preinstall(target, 'demo-skill', { version: '1.0.0' });
+
+    const result = run(pkg, ['update', '--dir', target], undefined, OFFLINE);
+
+    expect(result.status).toBe(0);
+    expect(result.all).toContain('could not check for a newer version');
+    // A failed check must never read as a clean bill of health.
+    expect(result.all).not.toContain('already at the latest version');
+    expect(JSON.parse(readFileSync(join(target, 'demo-skill', '.installed.json'), 'utf8')).version).toBe('2.0.0');
+  });
+
+  it('reports a development checkout and never looks anything up', () => {
+    const pkg = makePackage({ version: '0.0.0' });
+    const target = tempDir();
+    preinstall(target, 'demo-skill', { version: '0.0.0' });
+
+    const result = run(pkg, ['update', '--dir', target], undefined, OFFLINE);
+
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('development checkout');
+    expect(result.all).not.toContain('could not check');
+  });
+
+  it('rejects the update flags on the other commands', () => {
+    const pkg = makePackage();
+    const target = tempDir();
+
+    for (const command of ['install', 'list', 'uninstall']) {
+      for (const flag of ['--check', '--no-self-update']) {
+        const result = run(pkg, [command, flag, '--dir', target]);
+        expect(result.status).not.toBe(0);
+        expect(result.all).toContain('only applies to update');
+      }
+    }
+  });
+
+  it('lists update in the usage text', () => {
+    const result = run(makePackage(), ['--help']);
+
+    expect(result.stdout).toContain('update [skill...]');
+    expect(result.stdout).toContain('--check');
+    expect(result.stdout).toContain('--no-self-update');
+  });
+
+  describe('scope of filesystem effects', () => {
+    it('touches no Claude Code settings file and no other package\'s skills', () => {
+      const pkg = makePackage({ version: '2.0.0' });
+      const cwd = tempDir();
+      const target = join(cwd, '.claude', 'skills');
+      mkdirSync(target, { recursive: true });
+      preinstall(target, 'demo-skill', { version: '1.0.0' });
+      preinstall(target, 'theirs', { package: 'another-package' });
+      const theirs = snapshot(join(target, 'theirs'));
+
+      const result = run(pkg, ['update', '--no-self-update', '--project'], cwd, OFFLINE);
+
+      expect(result.status).toBe(0);
+      expect(existsSync(join(cwd, '.claude', 'settings.json'))).toBe(false);
+      expect(snapshot(join(target, 'theirs'))).toEqual(theirs);
+    });
+  });
+
+  describe('failure handling', () => {
+    const rootless = process.getuid?.() !== 0 ? it : it.skip;
+
+    rootless('exits non-zero on an unwritable destination and leaves nothing half-written', () => {
+      const pkg = makePackage({ version: '2.0.0' });
+      const target = tempDir();
+      preinstall(target, 'demo-skill', { version: '1.0.0' });
+      const before = snapshot(target);
+      chmodSync(target, 0o500);
+
+      try {
+        const result = run(pkg, ['update', '--no-self-update', '--dir', target]);
+
+        expect(result.status).not.toBe(0);
+        expect(result.stderr).toContain('update failed');
+      } finally {
+        chmodSync(target, 0o700);
+      }
+
+      // The old skill is still there, and no staging directory was left behind.
+      expect(snapshot(target)).toEqual(before);
+    });
+  });
+
+  it('never lets a test spawn a global install', () => {
+    const source = readFileSync(__filename, 'utf8');
+    const invocations = source.match(/runA?s?y?n?c?\(\s*pkg,\s*\[\s*'update'[\s\S]*?\);/g) ?? [];
+
+    expect(invocations.length).toBeGreaterThan(0);
+    for (const invocation of invocations) {
+      // Every CLI-level update run has to be one that cannot reach `npm install
+      // -g`: either self-update is off, or the run is a read-only one, or the
+      // registry is a closed port so the lookup fails before anything spawns.
+      // The upgrade argv is asserted through the injected runner instead.
+      expect(invocation).toMatch(/--no-self-update|--check|--dry-run|OFFLINE/);
+    }
   });
 });
