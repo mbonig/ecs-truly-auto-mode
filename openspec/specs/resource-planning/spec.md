@@ -1,7 +1,11 @@
 # resource-planning Specification
 
 ## Purpose
-TBD - created by archiving change ecs-truly-auto-mode. Update Purpose after archive.
+Turns an analysis profile into a complete list of the AWS resources the application needs, presents it for review
+alongside the shape of the project that will be generated, and records a create-or-adopt decision — with an
+existing identifier wherever a resource is adopted — for every entry. This is the gate: nothing is generated until
+the plan is complete and approved, because the plan is where a wrong inference costs nothing to fix.
+
 ## Requirements
 ### Requirement: Complete resource plan
 

@@ -1,7 +1,11 @@
 # infrastructure-generation Specification
 
 ## Purpose
-TBD - created by archiving change ecs-truly-auto-mode. Update Purpose after archive.
+Emits a CDK TypeScript application realizing the approved resource plan as two stacks — a platform stack that
+changes rarely and a service stack that changes on every deploy — coupled through SSM Parameter Store rather than
+CloudFormation exports. The project's shape is a recorded, user-selected choice between a plain CDK app and a
+projen AwsCdkTypeScriptApp, and synthesis must succeed with no AWS credentials.
+
 ## Requirements
 ### Requirement: CDK application output
 

@@ -1,7 +1,11 @@
 # skill-orchestration Specification
 
 ## Purpose
-TBD - created by archiving change ecs-truly-auto-mode. Update Purpose after archive.
+Defines the skill's end-to-end flow: what triggers it, the ordered phases and the gates between them, the persisted
+manifest that makes runs resumable and incremental, and the rule that an unresolved finding becomes a question to
+the user rather than a silent default. It also governs what the skill must never do — read a secret's value, modify
+application source, or overwrite a generated file that has been edited.
+
 ## Requirements
 ### Requirement: Skill packaging and invocation
 
