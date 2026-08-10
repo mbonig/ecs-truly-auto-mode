@@ -46,6 +46,29 @@ export interface PlannedUninstall {
   readonly record: InstallRecord;
 }
 
+/** What an update would do with one shipped skill at the target. */
+export type UpdateDisposition =
+  /** Installed by this CLI: replace it with the packaged copy. */
+  | 'refresh'
+  /** A directory is there that this CLI did not install: leave it alone. */
+  | 'unmanaged'
+  /** Not installed: `update` refreshes, it does not add. */
+  | 'absent';
+
+export interface UpdateRow {
+  readonly skill: Skill;
+  readonly destination: string;
+  readonly disposition: UpdateDisposition;
+  /** The record found at the destination, when there is one this CLI wrote. */
+  readonly installed?: InstallRecord;
+}
+
+export interface UpdatePlan {
+  readonly rows: UpdateRow[];
+  /** The rows to be refreshed, as install entries the existing installer accepts. */
+  readonly refreshes: PlannedInstall[];
+}
+
 function inspectExisting(destination: string): ExistingInstall | undefined {
   if (!existsSync(destination)) return undefined;
   return { path: destination, record: readInstallRecord(destination) };
@@ -169,6 +192,61 @@ export function listSkills(
       status: versionStatus(existing.record.version, pkg.version),
     };
   });
+}
+
+/**
+ * Work out what an update would do, before anything is written.
+ *
+ * The classification is the whole of the command's safety: only a directory
+ * carrying this package's install record may be replaced. A directory this CLI
+ * did not install is never written to — not even with --force, since `update`
+ * is run on a schedule and from scripts, where a silent overwrite of someone's
+ * hand-edited skill is a loss with no warning attached.
+ *
+ * When skills were named explicitly, anything that cannot be refreshed refuses
+ * the run; when they were not, it is reported and skipped so the skills that
+ * can be refreshed still are.
+ */
+export function planUpdate(
+  skills: readonly Skill[],
+  target: Target,
+  pkg: PackageInfo,
+  namedExplicitly: boolean,
+): UpdatePlan {
+  const rows = skills.map((skill): UpdateRow => {
+    const destination = join(target.path, skill.name);
+    const existing = inspectExisting(destination);
+
+    if (!existing) return { skill, destination, disposition: 'absent' };
+    if (!existing.record || existing.record.package !== pkg.name) {
+      return { skill, destination, disposition: 'unmanaged' };
+    }
+
+    return { skill, destination, disposition: 'refresh', installed: existing.record };
+  });
+
+  if (namedExplicitly) {
+    for (const row of rows) {
+      if (row.disposition === 'absent') {
+        throw new CliError(
+          `"${row.skill.name}" is not installed at ${target.path}`,
+          'Run `install` to add it. `update` only refreshes skills that are already installed.',
+        );
+      }
+      if (row.disposition === 'unmanaged') {
+        throw new CliError(
+          `refusing to update ${row.destination}`,
+          `It has no ${INSTALL_RECORD} from ${pkg.name}, so it was not installed by this CLI. Use \`install --force\` if you mean to replace it.`,
+        );
+      }
+    }
+  }
+
+  const refreshes = rows
+    .filter((row) => row.disposition === 'refresh')
+    .map((row) => ({ skill: row.skill, destination: row.destination }));
+
+  return { rows, refreshes };
 }
 
 export function planUninstall(
