@@ -173,15 +173,21 @@ The `id` is derived from the resource's role: `receipts-bucket`, `sessions-table
 ### `github-oidc-role`
 
 **Included:** when `pipeline.target` is `github-actions`.
-**Created with:** a trust policy on the GitHub OIDC provider, scoped to
-`repo:<owner>/<repo>:*`, and permissions limited to the ECR repository, the service
-stack, and the SSM prefix.
+**Created with:** a trust policy on the GitHub OIDC provider, scoped to both
+`repo:<owner>/<repo>:*` and the GitHub Enterprise Managed Users (EMU) form
+`repo:<owner>@*/<repo>@*:*`, and permissions limited to the ECR repository, the
+service stack, the SSM prefix, and `sts:AssumeRole` on the CDK bootstrap roles.
 **Adopt identifiers:** `roleArn`.
 
 The trust policy must be scoped to the repository. A trust policy accepting the
 GitHub OIDC provider without a `sub` condition can be assumed from **any** GitHub
 repository in the world, which is a full account compromise rather than a
 misconfiguration.
+
+Both `sub` forms are granted unconditionally rather than detected, because whether a
+given GitHub org is on EMU is not derivable from the repository, the manifest, or a
+synth-time check — see [contract.md](../pipeline/contract.md#2-authenticate) for the
+failure mode this avoids and how to diagnose it if it recurs.
 
 Also included: `github-oidc-provider`, adopted when the account already has one —
 which is common, and creating a second fails.

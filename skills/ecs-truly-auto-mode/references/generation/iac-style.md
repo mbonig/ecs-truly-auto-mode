@@ -15,6 +15,13 @@ the scaffolding, not about what gets deployed.
 That equivalence is the property to preserve. If a change makes one style synthesize
 a different template than the other, the change is wrong.
 
+"Byte-identical" is scoped to a fixed `pipeline.target`, not across targets:
+`platform-stack.ts` conditionally instantiates the GitHub OIDC role via an optional
+`githubActions` prop that `bin/app.ts`/`src/main.ts` populate only when the recorded
+target is `github-actions`. The same manifest generated once for each target
+therefore synthesizes platform stacks that differ by that role's presence — that
+difference is expected and does not violate the equivalence this file is about.
+
 ## Asking
 
 Ask it in Phase 2, batched with the pipeline target — both are generation-shape
@@ -160,6 +167,12 @@ A run whose recorded style differs from the style now requested is a **new proje
 not a conversion. Nothing converts an existing `infra/` in place: the new layout is
 written and the overwrite check guards everything already on disk. Say that plainly
 rather than half-converting a directory.
+
+**Re-running against a manifest generated before the ECS service was given a
+deterministic `serviceName`** replaces the `AWS::ECS::Service` on the next deploy —
+`serviceName` is immutable, so CloudFormation cannot update it in place. Say so before
+the deploy runs, not after. This is a one-time disruption per app, mitigated by the
+service stack's rolling circuit breaker, not an ongoing concern.
 
 ## Pipeline implications
 

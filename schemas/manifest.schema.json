@@ -28,7 +28,12 @@
       "properties": {
         "account": { "type": "string", "pattern": "^[0-9]{12}$" },
         "region": { "type": "string", "pattern": "^[a-z]{2}(-gov)?-[a-z]+-[0-9]$" },
-        "ssmPrefix": { "type": "string", "pattern": "^/[A-Za-z0-9._/-]+$" }
+        "ssmPrefix": { "type": "string", "pattern": "^/[A-Za-z0-9._/-]+$" },
+        "cdkQualifier": {
+          "description": "The target account's CDK bootstrap qualifier. Defaults to hnb659fds, the CDK default, when absent. A custom value here means the account was bootstrapped with `cdk bootstrap --qualifier <value>`, which changes the name of every bootstrap role and bucket the deploy role must reach.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9]{1,10}$"
+        }
       }
     },
 

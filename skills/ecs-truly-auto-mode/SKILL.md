@@ -144,8 +144,10 @@ deliberately excluded. Under `infra.style: projen` the service stack lives at
 pins the CDK version the stack is synthesized with.
 
 - **GitHub Actions** → `.github/workflows/deploy.yml` from
-  [`./assets/templates/pipeline/github-actions/`](./assets/templates/pipeline/github-actions/),
-  plus the OIDC role in the platform stack.
+  [`./assets/templates/pipeline/github-actions/`](./assets/templates/pipeline/github-actions/).
+  The platform stack template already instantiates the GitHub OIDC role itself,
+  gated on the `githubActions` prop `bin/app.ts` passes when `pipeline.target` is
+  `github-actions` — nothing to hand-wire here.
 - **CodePipeline** → `CodePipelineTarget` added to the platform stack.
 
 ---
@@ -207,7 +209,7 @@ Report:
 3. **The service stack is deployed by the pipeline**, on push to the configured
    branch. It is not deployed by hand and not deployed by the platform stack.
 4. **What the user must do** — create secrets that don't exist yet, complete a
-   CodeConnections handshake, add the OIDC role, point DNS.
+   CodeConnections handshake, point DNS.
 5. **Adopted resources this depends on**, so a later change to one is understood to
    affect this service.
 6. **Expected synth warnings.** `cdk synth` reports template-validation warnings on

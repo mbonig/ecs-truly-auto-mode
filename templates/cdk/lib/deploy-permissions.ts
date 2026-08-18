@@ -21,6 +21,8 @@ export interface DeployPermissionsProps {
   readonly taskRoleArn: string;
   readonly executionRoleArn: string;
   readonly clusterName: string;
+  /** The target account's CDK bootstrap qualifier — see config.ts's AppConfig.cdkQualifier. */
+  readonly cdkQualifier: string;
 }
 
 /**
@@ -123,6 +125,21 @@ export function deployPolicyStatements(props: DeployPermissionsProps): iam.Polic
       actions: ['ssm:GetParameter'],
       resources: [`arn:aws:ssm:${region}:${account}:parameter/cdk-bootstrap/*`],
     }),
+
+    // `cdk deploy` publishes the template through the file-publishing role and
+    // executes the change set through the deploy role — not the caller's own
+    // credentials. Without this, the CDK CLI silently falls back to the caller's
+    // identity, which the bootstrap assets bucket policy then rejects with an error
+    // naming an S3 bucket, not this missing grant.
+    new iam.PolicyStatement({
+      sid: 'AssumeCdkBootstrapRoles',
+      actions: ['sts:AssumeRole'],
+      resources: [
+        `arn:aws:iam::${account}:role/cdk-${props.cdkQualifier}-deploy-role-${account}-${region}`,
+        `arn:aws:iam::${account}:role/cdk-${props.cdkQualifier}-file-publishing-role-${account}-${region}`,
+        `arn:aws:iam::${account}:role/cdk-${props.cdkQualifier}-lookup-role-${account}-${region}`,
+      ],
+    }),
   ];
 }
 
@@ -153,6 +170,8 @@ export class GitHubOidcRole extends Construct {
       providerArn,
     );
 
+    const [owner, repoName] = props.repository.split('/');
+
     this.role = new iam.Role(this, 'Role', {
       roleName: `${props.appName}-deploy`,
       description: `GitHub Actions deploy role for ${props.repository}`,
@@ -164,7 +183,15 @@ export class GitHubOidcRole extends Construct {
           'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
         },
         StringLike: {
-          'token.actions.githubusercontent.com:sub': `repo:${props.repository}:*`,
+          'token.actions.githubusercontent.com:sub': [
+            `repo:${props.repository}:*`,
+            // GitHub Enterprise Managed Users orgs embed numeric IDs in both the
+            // owner and repo segments of the sub claim
+            // (repo:<owner>@<id>/<repo>@<id>:ref:...). There is no way to detect
+            // this at generation time, so both forms are always granted rather
+            // than choosing one.
+            `repo:${owner}@*/${repoName}@*:*`,
+          ],
         },
       }),
       maxSessionDuration: cdk.Duration.hours(1),

@@ -158,6 +158,33 @@ aws dynamodb describe-table --table-name <name> --region <region>
 Record the table ARN, and the index ARNs if the code queries indexes — index access
 needs `<table-arn>/index/*` in addition to the table itself.
 
+### CDK bootstrap qualifier
+
+`cdk deploy` publishes templates and executes change sets through the bootstrap
+roles, not the deploying principal's own credentials — the deploy role needs
+`sts:AssumeRole` on them, scoped to the qualifier the target account was
+bootstrapped with. Confirm that qualifier during planning rather than discovering
+it at first deploy, where the failure names an S3 bucket rather than the missing
+grant:
+
+```bash
+aws ssm get-parameter --name /cdk-bootstrap/<qualifier>/version --region <region>
+```
+
+Default `<qualifier>` to `hnb659fds` when `target.cdkQualifier` is not supplied. A
+missing parameter at that qualifier means the target account and region have never
+been CDK-bootstrapped — surface that in the plan:
+
+```
+No CDK bootstrap found in 581514672367/us-east-1 at qualifier "hnb659fds".
+Run `cdk bootstrap aws://581514672367/us-east-1` before the first deploy, or supply
+the qualifier the account was actually bootstrapped with.
+```
+
+A custom qualifier changes the name of every bootstrap role and bucket
+(`cdk-<qualifier>-deploy-role-...`, `cdk-<qualifier>-assets-...`), so getting this
+wrong is silent until the pipeline's first real deploy.
+
 ### GitHub OIDC provider
 
 ```bash
