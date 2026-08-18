@@ -133,6 +133,10 @@ plan:
     - id: github-oidc-role
       action: create
       reason: Pipeline target is github-actions
+    - id: github-oidc-provider
+      action: create
+      reason: aws iam list-open-id-connect-providers returned no GitHub provider in this account
+      validated: true
 
 pipeline:
   target: github-actions

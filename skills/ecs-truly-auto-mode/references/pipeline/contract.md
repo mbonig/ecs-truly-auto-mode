@@ -52,6 +52,21 @@ The `AccessDenied` event's `userIdentity` records the exact `principalId`/`userN
 string GitHub presented, which is the literal `sub` value a trust policy needs to
 match.
 
+**The two OIDC *provider* failures, which are earlier and look nothing alike.** The
+role above trusts an OIDC provider, and whether the platform stack creates that
+provider or trusts an existing one is the `github-oidc-provider` plan decision. Getting
+it wrong fails in one of two directions:
+
+| Symptom | What it means |
+| --- | --- |
+| Platform deploy fails: `EntityAlreadyExists` creating an OIDC provider | The plan recorded `create`, but the account already has one. Re-plan the entry as `adopt` with the existing ARN. |
+| Platform deploy fails creating the deploy role, on an invalid principal in the trust policy | The plan recorded `adopt` naming a provider that isn't there. Confirm the ARN with `aws iam list-open-id-connect-providers`, or re-plan as `create`. |
+
+Both are platform-stack deploy failures, not pipeline failures — they happen before any
+workflow runs. A provider that exists but lacks `sts.amazonaws.com` in its client ID
+list is the one that gets through both and fails at the workflow's first
+`AssumeRoleWithWebIdentity` instead.
+
 ### 3. Build
 
 ```

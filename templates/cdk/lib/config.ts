@@ -50,9 +50,22 @@ export type NetworkConfig =
 /** A resource that is either created here or imported by identifier. */
 export type Adoptable<T> = { readonly mode: 'create' } | ({ readonly mode: 'adopt' } & T);
 
+/**
+ * A public hostname served over HTTPS.
+ *
+ * The hosted zone is always adopted — creating one means delegating nameservers at a
+ * registrar, which is outside what this tool can verify. That is also what makes a
+ * *created* certificate possible: DNS validation needs a zone to write its validation
+ * record into, so the zone, not the certificate, is what gates a public hostname.
+ */
 export interface PublicHostname {
   readonly hostname: string;
-  readonly certificateArn: string;
+  /**
+   * Created DNS-validated against the zone below, or imported by ARN. An imported
+   * certificate must already be `ISSUED` and in the load balancer's region — a
+   * `us-east-1` certificate cut for CloudFront is the usual mistake.
+   */
+  readonly certificate: Adoptable<{ certificateArn: string }>;
   readonly hostedZoneId: string;
   readonly zoneName: string;
 }
@@ -155,5 +168,20 @@ export interface AppConfig {
  * platform stack needs the GitHub OIDC role.
  */
 export type PipelineConfig =
-  | { readonly target: 'github-actions'; readonly branch: string; readonly repository: string }
+  | {
+      readonly target: 'github-actions';
+      readonly branch: string;
+      readonly repository: string;
+      /**
+       * Whether this account already has an OIDC provider for
+       * `token.actions.githubusercontent.com`. Most do, and creating a second fails
+       * with `EntityAlreadyExists` — but an account that genuinely has none needs one,
+       * so this is a decision rather than a constant.
+       *
+       * Deliberately a union rather than an optional ARN. An absent optional field
+       * means "create" by omission, which is exactly how a stack that fails on every
+       * account with an existing provider shipped in the first place.
+       */
+      readonly oidcProvider: Adoptable<{ providerArn: string }>;
+    }
   | { readonly target: 'codepipeline'; readonly branch: string };

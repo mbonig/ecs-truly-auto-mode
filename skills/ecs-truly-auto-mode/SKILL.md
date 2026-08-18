@@ -216,6 +216,8 @@ Report:
    the service stack about subnet IDs and role ARNs "not matching expected format".
    These are false positives: the linter evaluates each SSM parameter's default,
    which is the parameter path, while CloudFormation resolves the real value at
-   deploy time.
+   deploy time. An app that creates the GitHub OIDC provider adds one more — a
+   `cfn-lint` W3005 about a redundant `DependsOn` — which comes from the CDK's own
+   custom-resource framework and not from anything in the generated stack.
 
 Say plainly that the generated app needs nothing from this skill to keep working.

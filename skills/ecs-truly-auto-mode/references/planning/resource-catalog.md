@@ -87,12 +87,22 @@ routine deploy replaces the target group and its listener rule.
 ### `certificate`
 
 **Included:** when a public hostname is recorded.
-**Created:** DNS-validated, requiring a hosted zone in the same account.
+**Created:** DNS-validated against the adopted hosted zone. **Offer `create` only when
+`hosted-zone` is adopted** — validation writes a record into that zone, so without one
+there is nowhere for it to go.
 **Adopt identifiers:** `certificateArn`.
 
 Must be in the same region as the ALB. A certificate created for CloudFront in
 `us-east-1` is a common thing to have lying around and a common thing to mistakenly
 reach for.
+
+Check the hostname against the zone before accepting `create`: it must be the
+`zoneName` itself or a subdomain of it. A certificate validated against a zone that is
+not authoritative for the name **never issues**, and CloudFormation waits on it rather
+than failing — the platform stack sits in `CREATE_IN_PROGRESS` until it times out.
+Say that when the user picks `create`: the first platform deploy blocks until ACM
+issues, which is normally a couple of minutes. It lands once, because the platform
+stack is the rarely-deployed one.
 
 ### `hosted-zone` / `dns-record`
 
@@ -189,8 +199,29 @@ given GitHub org is on EMU is not derivable from the repository, the manifest, o
 synth-time check — see [contract.md](../pipeline/contract.md#2-authenticate) for the
 failure mode this avoids and how to diagnose it if it recurs.
 
-Also included: `github-oidc-provider`, adopted when the account already has one —
-which is common, and creating a second fails.
+### `github-oidc-provider`
+
+**Included:** when `pipeline.target` is `github-actions`. **Required** — this entry is
+not optional and has no default.
+**Created:** an OIDC provider for `https://token.actions.githubusercontent.com` with
+the `sts.amazonaws.com` client ID, for an account that has none.
+**Adopt identifiers:** `providerArn`.
+
+Decide it by looking, not by asking or assuming. Most accounts already have a GitHub
+provider, and creating a second fails the first platform deploy with
+`EntityAlreadyExists` — but an account that genuinely has none needs one, so neither
+action is safe as a default. The procedure, including what to do when the account
+cannot be reached, is in
+[adopt-validation.md](./adopt-validation.md#github-oidc-provider).
+
+An adopted provider is used as-is. The stack reads its ARN and does not touch its
+thumbprints or client IDs, so a provider created by another tool without
+`sts.amazonaws.com` in its client ID list will fail at pipeline run time rather than at
+deploy time.
+
+The created provider is a CDK custom resource, which puts one Lambda function in the
+platform stack. That handler runs in the Lambda service rather than the workload's VPC,
+so an `egress: none` application with no NAT gateway can still create one.
 
 ### `codepipeline`
 

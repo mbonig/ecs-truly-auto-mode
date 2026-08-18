@@ -26,7 +26,17 @@ new PlatformStack(app, `${config.name}-platform`, {
   env,
   config,
   ...(pipeline.target === 'github-actions'
-    ? { githubActions: { repository: pipeline.repository, branch: pipeline.branch } }
+    ? {
+        githubActions: {
+          repository: pipeline.repository,
+          branch: pipeline.branch,
+          // Adopt the provider the plan found in the account. Omitted when the plan
+          // recorded that there is none, which is the only case that creates one.
+          ...(pipeline.oidcProvider.mode === 'adopt'
+            ? { existingProviderArn: pipeline.oidcProvider.providerArn }
+            : {}),
+        },
+      }
     : {}),
   description: `Long-lived platform resources for ${config.name} (ecs-truly-auto-mode)`,
 });
