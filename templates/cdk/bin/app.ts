@@ -17,7 +17,7 @@
 import * as cdk from 'aws-cdk-lib';
 import { PlatformStack } from '../lib/platform-stack';
 import { ServiceStack } from '../lib/service-stack';
-import { config } from '../lib/app-config';
+import { config, pipeline } from '../lib/app-config';
 
 const app = new cdk.App();
 const env = { account: config.env.account, region: config.env.region };
@@ -25,6 +25,9 @@ const env = { account: config.env.account, region: config.env.region };
 new PlatformStack(app, `${config.name}-platform`, {
   env,
   config,
+  ...(pipeline.target === 'github-actions'
+    ? { githubActions: { repository: pipeline.repository, branch: pipeline.branch } }
+    : {}),
   description: `Long-lived platform resources for ${config.name} (ecs-truly-auto-mode)`,
 });
 

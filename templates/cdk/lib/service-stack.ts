@@ -116,6 +116,11 @@ export class ServiceStack extends cdk.Stack {
     const service = new ecs.FargateService(this, 'Service', {
       cluster,
       taskDefinition,
+      // Deterministic name: deploy-permissions.ts's EcsService IAM grant and the
+      // pipeline's "wait for steady state" step both address the service by
+      // <app.name> directly. Leaving this to the CloudFormation default produces a
+      // generated physical name that matches neither.
+      serviceName: config.name,
       desiredCount: config.sizing.desiredCount,
       assignPublicIp: false,
       securityGroups: [

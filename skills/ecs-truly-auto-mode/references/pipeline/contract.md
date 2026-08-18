@@ -32,6 +32,26 @@ No long-lived AWS credentials are ever stored in the repository.
   in `pipeline.roleArn`, whose trust policy is scoped to this repository.
 - **CodePipeline** — the CodeBuild service role, already inside AWS.
 
+**Failure mode: `Could not assume role with OIDC: Not authorized to perform
+sts:AssumeRoleWithWebIdentity`.** The trust policy's `sub` condition doesn't match
+what GitHub actually sent. This happens even with a correctly-scoped trust policy
+when the org is on **GitHub Enterprise Managed Users (EMU)** — EMU embeds numeric IDs
+in both the owner and repo segments of the claim
+(`repo:<owner>@<id>/<repo>@<id>:ref:...`), which the generated role's trust policy
+already grants alongside the standard form (see `deploy-permissions.ts`'s
+`GitHubOidcRole`). The fastest way to confirm the actual claim GitHub sent, rather
+than guessing:
+
+```bash
+aws cloudtrail lookup-events \
+  --lookup-attributes AttributeKey=EventName,AttributeValue=AssumeRoleWithWebIdentity \
+  --max-results 5 --query 'Events[].CloudTrailEvent' --output text | jq .userIdentity
+```
+
+The `AccessDenied` event's `userIdentity` records the exact `principalId`/`userName`
+string GitHub presented, which is the literal `sub` value a trust policy needs to
+match.
+
 ### 3. Build
 
 ```
@@ -151,10 +171,17 @@ The deploying principal is scoped to what these steps need and nothing more:
 | `cloudformation:*` on the stack | `<app>-service/*` only — **not** the platform stack |
 | `ecs:RegisterTaskDefinition`, `UpdateService`, `DescribeServices` | scoped to the cluster where possible |
 | `iam:PassRole` | the task and execution roles only |
+| `sts:AssumeRole` | the CDK bootstrap deploy, file-publishing, and lookup roles, at `target.cdkQualifier` |
 
 `iam:PassRole` is the one worth scoping carefully. Unscoped, it lets the pipeline
 pass *any* role to ECS, which is an escalation path to whatever the most privileged
 role in the account can do.
+
+The `sts:AssumeRole` grant on the bootstrap roles is not optional: `cdk deploy`
+publishes the template and executes the change set through those roles, not the
+deploying principal's own credentials. Omitting it does not fail loudly — the CDK
+CLI falls back to the caller's own credentials, and the failure that eventually
+surfaces names the bootstrap assets S3 bucket rather than this missing grant.
 
 The platform stack is excluded from the CloudFormation permissions on purpose: the
 pipeline has no reason to modify networking or IAM, and not granting it means a

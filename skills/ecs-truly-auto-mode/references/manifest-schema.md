@@ -53,6 +53,7 @@ a silently-wrong region is expensive to discover.
 | `account` | string | 12-digit AWS account ID. |
 | `region` | string | e.g. `us-east-1`. |
 | `ssmPrefix` | string | Path prefix for the inter-stack parameters. Defaults to `/ecs-auto-mode/<app.name>`. |
+| `cdkQualifier` | string | The target account's CDK bootstrap qualifier. Defaults to `hnb659fds`. Validated during planning — see [adopt-validation.md](./planning/adopt-validation.md#cdk-bootstrap-qualifier). Only differs from the default when the account was bootstrapped with `cdk bootstrap --qualifier <value>`, which changes the name of every bootstrap role and bucket the deploy role assumes. |
 
 ## `analysis` (object, required)
 

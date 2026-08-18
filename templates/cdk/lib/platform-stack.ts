@@ -24,9 +24,25 @@ import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as targets from 'aws-cdk-lib/aws-route53-targets';
 import { AppConfig, AwsServiceKey } from './config';
+import { GitHubOidcRole } from './deploy-permissions';
+
+export interface PlatformStackGitHubActions {
+  readonly repository: string;
+  readonly branch: string;
+  /** Set when the account already has a GitHub OIDC provider; creating a second fails. */
+  readonly existingProviderArn?: string;
+}
 
 export interface PlatformStackProps extends cdk.StackProps {
   readonly config: AppConfig;
+  /**
+   * Present only when the recorded pipeline target is `github-actions`. Wires the
+   * GitHub OIDC-trusted deploy role into this stack, using the task role, execution
+   * role, cluster and repository already constructed here — see deploy-permissions.ts.
+   * Absent for `codepipeline`, which authenticates through a CodeStar connection
+   * instead.
+   */
+  readonly githubActions?: PlatformStackGitHubActions;
 }
 
 export class PlatformStack extends cdk.Stack {
@@ -35,6 +51,7 @@ export class PlatformStack extends cdk.Stack {
   public readonly repository: ecr.IRepository;
 
   private readonly config: AppConfig;
+  private readonly githubActions?: PlatformStackGitHubActions;
 
   /**
    * Serving AZs from config rather than the default implementation is what keeps
@@ -51,6 +68,7 @@ export class PlatformStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: PlatformStackProps) {
     super(scope, id, props);
     const config = (this.config = props.config);
+    this.githubActions = props.githubActions;
 
     this.vpc = this.buildVpc();
 
@@ -75,6 +93,8 @@ export class PlatformStack extends cdk.Stack {
     const targetGroup = config.loadBalancer
       ? this.buildLoadBalancing(this.vpc, taskSecurityGroup)
       : undefined;
+
+    this.buildGitHubOidcRole({ taskRole, executionRole });
 
     this.publishParameters({ logGroup, taskSecurityGroup, executionRole, taskRole, targetGroup });
   }
@@ -473,6 +493,34 @@ export class PlatformStack extends cdk.Stack {
       zone,
       recordName: hostname,
       target: route53.RecordTarget.fromAlias(new targets.LoadBalancerTarget(alb)),
+    });
+  }
+
+  // ------------------------------------------------------------- pipeline OIDC
+
+  /**
+   * Wired only for the github-actions pipeline target — CodePipeline authenticates
+   * through a CodeStar connection instead and needs no OIDC role. Previously this
+   * wiring lived outside the shipped templates entirely, hand-authored per app,
+   * which is how a hardcoded bootstrap qualifier and a non-EMU trust pattern each
+   * shipped without a template to diverge from.
+   */
+  private buildGitHubOidcRole(refs: { taskRole: iam.IRole; executionRole: iam.IRole }): void {
+    if (!this.githubActions) return;
+
+    new GitHubOidcRole(this, 'GitHubOidcRole', {
+      appName: this.config.name,
+      account: this.account,
+      region: this.region,
+      ssmPrefix: this.config.ssmPrefix,
+      cdkQualifier: this.config.cdkQualifier,
+      repositoryArn: this.repository.repositoryArn,
+      clusterName: this.cluster.clusterName,
+      taskRoleArn: refs.taskRole.roleArn,
+      executionRoleArn: refs.executionRole.roleArn,
+      repository: this.githubActions.repository,
+      branch: this.githubActions.branch,
+      existingProviderArn: this.githubActions.existingProviderArn,
     });
   }
 

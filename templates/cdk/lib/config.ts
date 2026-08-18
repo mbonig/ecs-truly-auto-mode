@@ -106,6 +106,12 @@ export interface AppConfig {
   readonly env: { readonly account: string; readonly region: string };
   /** SSM path prefix carrying the platform → service contract. */
   readonly ssmPrefix: string;
+  /**
+   * The target account's CDK bootstrap qualifier — `hnb659fds` unless the account
+   * was bootstrapped with `cdk bootstrap --qualifier <value>`. Names the bootstrap
+   * roles the deploy role is granted `sts:AssumeRole` on; see deploy-permissions.ts.
+   */
+  readonly cdkQualifier: string;
 
   readonly architecture: Architecture;
   readonly containerPort: number;
@@ -142,3 +148,12 @@ export interface AppConfig {
   readonly environment: Record<string, string>;
   readonly secrets: SecretRef[];
 }
+
+/**
+ * The pipeline's own shape — kept separate from `AppConfig`, which is a pure
+ * projection of the resource plan. `bin/app.ts` reads this to decide whether the
+ * platform stack needs the GitHub OIDC role.
+ */
+export type PipelineConfig =
+  | { readonly target: 'github-actions'; readonly branch: string; readonly repository: string }
+  | { readonly target: 'codepipeline'; readonly branch: string };
