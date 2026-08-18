@@ -257,46 +257,10 @@ commits: a `feat:` title produces a minor release, anything else a patch.
 
 Two prerequisites, neither of which the workflow can solve for itself:
 
-- **A trusted publisher configured on npm** — see below. There is no `NPM_TOKEN`.
+- **A trusted publisher configured on npm** — publishing uses OIDC trusted publishing,
+  so there is no `NPM_TOKEN`.
 - **A public repository.** npm provenance requires one; on a private repository the
   publish fails until `npmProvenance: false` is set in `.projenrc.ts`.
-
-#### Authenticating to npm: trusted publishing
-
-Publishing uses **OIDC trusted publishing** rather than a long-lived token. GitHub
-mints a short-lived identity for the workflow run and npm verifies it, so there is no
-secret to leak, rotate, or have silently expire.
-
-This is not merely tidier. The first release attempt here used an `NPM_TOKEN` and
-failed with:
-
-```
-npm error code EOTP
-npm error This operation requires a one-time password.
-```
-
-and npm's own output in that same run warned that *"npm tokens that bypass 2FA are
-being restricted for account changes and direct publishing."* Token-based CI
-publishing is on its way out.
-
-To configure it:
-
-1. Sign in at [npmjs.com](https://www.npmjs.com/) as the owner of the `@matthewbonig`
-   scope.
-2. Go to the package page → **Settings** → **Trusted Publisher** (for
-   `@matthewbonig/ecs-truly-auto-mode-skill`).
-3. Choose **GitHub Actions** and fill in exactly:
-   - Organization or user: `mbonig`
-   - Repository: `ecs-truly-auto-mode`
-   - Workflow filename: `release.yml`
-   - Environment: *leave empty* — the release job does not use a GitHub environment
-4. Save. The next release authenticates automatically.
-
-**Chicken-and-egg:** npm's trusted-publisher settings live on a package page, so the
-package generally has to exist first. If npm will not let you configure a publisher
-for a package that has never been published, publish once by hand —
-`npm publish --access public` from a clean checkout after `npx projen build` — then
-configure the trusted publisher and let automation take over from the next merge.
 
 To verify without publishing, run the **release** workflow from the Actions tab with
 **Dry run** ticked.
