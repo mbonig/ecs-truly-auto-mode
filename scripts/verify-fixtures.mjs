@@ -55,7 +55,18 @@ function planEntry(manifest, id) {
 
 /** Synthesize a fixture's manifest and return both templates. */
 function synth(fixture) {
-  const manifestPath = join(repo, 'examples', fixture, 'expected-manifest.yaml');
+  return synthManifest(join(repo, 'examples', fixture, 'expected-manifest.yaml'));
+}
+
+/**
+ * Synthesize any manifest and return both templates.
+ *
+ * Split out from `synth` so the standalone manifests under examples/manifests/ can be
+ * synthesized too. The fixtures are sample *applications*, and none of them serves a
+ * public hostname — which is exactly why a certificate that could only ever be adopted
+ * went unnoticed for as long as it did.
+ */
+function synthManifest(manifestPath) {
   const configPath = join(cdkDir, 'lib', 'app-config.ts');
 
   execFileSync(process.execPath, [join(here, 'generate-config.mjs'), manifestPath, configPath], {
@@ -76,7 +87,7 @@ function synth(fixture) {
     },
   });
 
-  const name = load(fixture).app.name;
+  const name = parseYaml(readFileSync(manifestPath, 'utf8')).app.name;
   const read = (stack) =>
     JSON.parse(readFileSync(join(cdkDir, 'cdk.out', `${name}-${stack}.template.json`), 'utf8'));
   return { platform: read('platform'), service: read('service') };
@@ -217,6 +228,123 @@ console.log('\nfailing-build — the build gate:\n');
     'a manifest here would mean the run continued past a failed build');
   check('Dockerfile runs npm ci', /npm ci/.test(readFileSync(join(dir, 'Dockerfile'), 'utf8')));
   check('no lockfile is present, so npm ci must fail', !existsSync(join(dir, 'package-lock.json')));
+}
+
+console.log('\ncreated-certificate — the create paths for the certificate and the OIDC provider:\n');
+{
+  const path = join(repo, 'examples', 'manifests', 'created-certificate.manifest.yaml');
+  const m = parseYaml(readFileSync(path, 'utf8'));
+  check('certificate is created, not adopted', planEntry(m, 'certificate').action === 'create');
+  check('hosted zone is adopted', planEntry(m, 'hosted-zone').action === 'adopt');
+  check('OIDC provider is created', planEntry(m, 'github-oidc-provider').action === 'create');
+
+  const { platform } = synthManifest(path);
+  const p = typesOf(platform);
+  const resources = Object.values(platform.Resources);
+
+  check(
+    'one certificate is synthesized',
+    p['AWS::CertificateManager::Certificate'] === 1,
+    `got ${p['AWS::CertificateManager::Certificate']}`,
+  );
+
+  const cert = resources.find((r) => r.Type === 'AWS::CertificateManager::Certificate');
+  check(
+    'the certificate is DNS-validated against the recorded zone',
+    cert?.Properties?.ValidationMethod === 'DNS' &&
+      cert?.Properties?.DomainValidationOptions?.[0]?.HostedZoneId ===
+        planEntry(m, 'hosted-zone').identifiers.hostedZoneId,
+    JSON.stringify(cert?.Properties?.DomainValidationOptions),
+  );
+  check(
+    'the certificate is issued for the recorded hostname',
+    cert?.Properties?.DomainName === m.analysis.hostnames.public[0].value,
+    cert?.Properties?.DomainName,
+  );
+
+  // The hostname is only actually served if all three exist together: without the
+  // listener it is unreachable, without the record it is unresolvable.
+  check(
+    'an HTTPS listener and an HTTP redirect are both present',
+    p['AWS::ElasticLoadBalancingV2::Listener'] === 2,
+    `got ${p['AWS::ElasticLoadBalancingV2::Listener']}`,
+  );
+  check('exactly one alias record', p['AWS::Route53::RecordSet'] === 1, `got ${p['AWS::Route53::RecordSet']}`);
+  check(
+    'the load balancer is internet-facing',
+    resources.find((r) => r.Type === 'AWS::ElasticLoadBalancingV2::LoadBalancer')
+      ?.Properties?.Scheme === 'internet-facing',
+  );
+
+  const provider = resources.find((r) => r.Type === 'Custom::AWSCDKOpenIdConnectProvider');
+  check('an OIDC provider is synthesized', provider !== undefined);
+  check(
+    'the provider is GitHub\'s, with the STS client ID',
+    provider?.Properties?.Url === 'https://token.actions.githubusercontent.com' &&
+      provider?.Properties?.ClientIDList?.includes('sts.amazonaws.com'),
+    JSON.stringify(provider?.Properties?.ClientIDList),
+  );
+  // The provider's custom resource handler carries no VpcConfig, so it runs in the
+  // Lambda service rather than the workload's VPC. That is what lets an egress:none
+  // application — no NAT, isolated subnets — create a provider at all.
+  check(
+    'the provider handler is not placed in the VPC',
+    resources.filter((r) => r.Type === 'AWS::Lambda::Function').every((r) => !r.Properties?.VpcConfig),
+  );
+}
+
+console.log('\nadopted-vpc — the adopt paths for the certificate and the OIDC provider:\n');
+{
+  const path = join(repo, 'examples', 'manifests', 'adopted-vpc.manifest.yaml');
+  const m = parseYaml(readFileSync(path, 'utf8'));
+  check('certificate is adopted', planEntry(m, 'certificate').action === 'adopt');
+
+  const { platform } = synthManifest(path);
+  const p = typesOf(platform);
+
+  check(
+    'no certificate is synthesized',
+    !p['AWS::CertificateManager::Certificate'],
+    `found ${p['AWS::CertificateManager::Certificate']}`,
+  );
+  check(
+    'the listener references the adopted certificate ARN',
+    JSON.stringify(platform).includes(planEntry(m, 'certificate').identifiers.certificateArn),
+  );
+  check(
+    'an HTTPS listener and an HTTP redirect are both present',
+    p['AWS::ElasticLoadBalancingV2::Listener'] === 2,
+    `got ${p['AWS::ElasticLoadBalancingV2::Listener']}`,
+  );
+  check('exactly one alias record', p['AWS::Route53::RecordSet'] === 1, `got ${p['AWS::Route53::RecordSet']}`);
+}
+
+console.log('\ncreated-vpc — an adopted OIDC provider is trusted, not recreated:\n');
+{
+  const path = join(repo, 'examples', 'manifests', 'created-vpc.manifest.yaml');
+  const m = parseYaml(readFileSync(path, 'utf8'));
+  const entry = planEntry(m, 'github-oidc-provider');
+  check('OIDC provider is adopted', entry.action === 'adopt');
+
+  const { platform } = synthManifest(path);
+  const p = typesOf(platform);
+
+  // The failure this pins down is EntityAlreadyExists on the first platform deploy
+  // into any account that already has a GitHub provider — which is most of them.
+  check(
+    'no OIDC provider is synthesized',
+    !p['Custom::AWSCDKOpenIdConnectProvider'],
+    `found ${p['Custom::AWSCDKOpenIdConnectProvider']}`,
+  );
+  check(
+    'and no custom-resource handler comes with it',
+    !p['AWS::Lambda::Function'],
+    `found ${p['AWS::Lambda::Function']}`,
+  );
+  check(
+    'the deploy role trusts the recorded provider ARN',
+    JSON.stringify(platform).includes(entry.identifiers.providerArn),
+  );
 }
 
 rmSync(join(cdkDir, 'lib', 'app-config.ts'), { force: true });

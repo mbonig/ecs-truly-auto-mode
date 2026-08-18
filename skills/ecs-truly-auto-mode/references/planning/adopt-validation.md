@@ -90,6 +90,9 @@ condition either fails to route or takes over another service's traffic.
 
 ### ACM certificate
 
+**Adopt path only.** These checks presuppose a certificate that exists; the create
+path is checked differently, below.
+
 ```bash
 aws acm describe-certificate --certificate-arn <arn> --region <region>
 ```
@@ -102,6 +105,24 @@ reach for by mistake.
 Check the domain too: `DomainName` or a `SubjectAlternativeNames` entry must cover
 the recorded hostname, including the wildcard case. Note that `*.example.com` covers
 `api.example.com` but **not** `example.com` itself, and not `a.b.example.com`.
+
+### A certificate the stack will create
+
+There is nothing in AWS to check yet, so this is a precondition check on the plan
+itself — and it needs no credentials:
+
+- `hosted-zone` must be `adopt`. DNS validation writes a record into that zone, and
+  the skill does not create zones.
+- The recorded hostname must be the zone's `zoneName` or a subdomain of it.
+
+The second one is the check worth running. A certificate validated against a zone that
+is not authoritative for the name never issues, and CloudFormation does not fail on
+that — it waits, so the platform stack sits in `CREATE_IN_PROGRESS` until the stack
+times out. Catching it here costs a re-ask; missing it costs an hour and a rollback.
+
+What this cannot check is whether the adopted zone is the one actually served at the
+registrar. A zone that exists but was never delegated looks identical from here. When
+the user is unsure, adopting an already-`ISSUED` certificate is the honest recommendation.
 
 ### Route 53 hosted zone
 
@@ -187,13 +208,54 @@ wrong is silent until the pipeline's first real deploy.
 
 ### GitHub OIDC provider
 
+This one decides `create` versus `adopt` rather than confirming a value the user
+supplied, so run it **before** asking anything.
+
 ```bash
 aws iam list-open-id-connect-providers
 ```
 
-Look for one ending in `token.actions.githubusercontent.com`. Most accounts already
-have one, and creating a second fails — so this check decides create versus adopt
-rather than merely confirming a value.
+Look for one whose URL ends in `token.actions.githubusercontent.com`.
+
+| Outcome | Record |
+| --- | --- |
+| A match | `adopt`, `providerArn` set to its ARN, `validated: true` |
+| The call succeeded and returned no match | `create`, `validated: true` |
+| The call could not run | **ask** — see below |
+
+**A lookup that could not run is not the same as a provider that is not there.** No
+credentials, an expired session, or a denied `iam:ListOpenIDConnectProviders` all
+produce "no match" to anyone only looking for one. Recording that as `create` is how a
+first deploy fails with `EntityAlreadyExists` — and the accounts most likely to deny
+the call are the same locked-down accounts most likely to already have a provider. Only
+a call that *succeeded* and came back empty is evidence of absence.
+
+So when the call cannot be made, ask, and let the answer decide both ways:
+
+```
+Does account 071128183726 already have a GitHub OIDC provider?
+
+  I couldn't check — no credentials for this account.
+
+  yes   Paste its ARN. Suggested:
+        arn:aws:iam::071128183726:oidc-provider/token.actions.githubusercontent.com
+  no    One will be created by the platform stack.
+```
+
+Record `adopt` with the ARN the user gives, or `create`, either way with
+`validated: false` and a note in the plan that the answer was not verified. That ARN is
+conventional enough to offer as a suggestion, but record what the user confirms rather
+than assuming it — the prefix differs outside the commercial partition.
+
+When a provider is found, glance at its `ClientIDList` in the same breath:
+
+```bash
+aws iam get-open-id-connect-provider --open-id-connect-provider-arn <arn>
+```
+
+It needs `sts.amazonaws.com`. A provider created by another tool without it deploys
+fine and then fails on the pipeline's first run, which is a much more expensive place
+to find out.
 
 ### CodeConnections connection
 

@@ -31,6 +31,23 @@ function resource(manifest, id) {
   return (manifest.plan?.resources ?? []).find((r) => r.id === id);
 }
 
+/**
+ * Stop with a message naming what is missing.
+ *
+ * The plan is the gate, and a gate that lets an incomplete plan through quietly is
+ * worse than no gate: the output looks like a successful generation of a different
+ * application.
+ */
+function fail(message) {
+  console.error(`generate-config: ${message}`);
+  process.exit(1);
+}
+
+/** How a plan entry reads in an error message, including when it is not there at all. */
+function describeAction(entry) {
+  return entry ? `marked '${entry.action}'` : 'missing';
+}
+
 /** A plan entry becomes either {mode:'create'} or {mode:'adopt', ...identifiers}. */
 function adoptable(manifest, id, map) {
   const entry = resource(manifest, id);
@@ -58,18 +75,52 @@ function buildNetwork(manifest) {
   };
 }
 
+/**
+ * The public hostname, or nothing at all.
+ *
+ * The hosted zone is what gates this, not the certificate. Without a zone there is
+ * nowhere to put the alias record or a DNS validation record, so neither the record
+ * nor a created certificate can exist — and the skill never creates zones.
+ *
+ * Anything short of that is an error rather than an omission. Returning `undefined`
+ * for an incomplete plan is how a `certificate: create` decision used to produce an
+ * internal HTTP-only load balancer with no DNS record and no diagnostic.
+ */
 function buildPublicHostname(manifest) {
   const dns = resource(manifest, 'dns-record');
   const cert = resource(manifest, 'certificate');
   const zone = resource(manifest, 'hosted-zone');
   const hostname = manifest.analysis?.hostnames?.public?.[0]?.value;
 
+  // No hostname wanted: an internal load balancer serving HTTP is the intended shape.
   if (!hostname || !dns || dns.action === 'skip') return undefined;
-  if (cert?.action !== 'adopt' || zone?.action !== 'adopt') return undefined;
+
+  if (zone?.action !== 'adopt' || !zone.identifiers?.hostedZoneId || !zone.identifiers?.zoneName) {
+    fail(
+      `plan.resources: '${hostname}' is recorded as a public hostname, but the 'hosted-zone' entry is ` +
+        `${describeAction(zone)}. A public hostname needs an adopted hosted zone with hostedZoneId and ` +
+        'zoneName — the skill does not create hosted zones, because that means delegating nameservers ' +
+        'at a registrar.',
+    );
+  }
+
+  if (!cert || cert.action === 'skip') {
+    fail(
+      `plan.resources: '${hostname}' is recorded as a public hostname, but the 'certificate' entry is ` +
+        `${describeAction(cert)}. Serving it over HTTPS needs a certificate created or adopted.`,
+    );
+  }
+
+  if (cert.action === 'adopt' && !cert.identifiers?.certificateArn) {
+    fail("plan.resources: the 'certificate' entry is marked adopt but records no certificateArn.");
+  }
 
   return {
     hostname,
-    certificateArn: cert.identifiers.certificateArn,
+    certificate:
+      cert.action === 'adopt'
+        ? { mode: 'adopt', certificateArn: cert.identifiers.certificateArn }
+        : { mode: 'create' },
     hostedZoneId: zone.identifiers.hostedZoneId,
     zoneName: zone.identifiers.zoneName,
   };
@@ -139,11 +190,45 @@ function arnFor(kind, ids = {}, manifest) {
   return undefined;
 }
 
+/**
+ * The pipeline's shape, including the OIDC provider decision.
+ *
+ * That decision is required rather than defaulted. `GitHubOidcRole` creates a provider
+ * when it is handed no ARN, and most accounts already have one for
+ * `token.actions.githubusercontent.com` — so a missing decision here is a first deploy
+ * that fails with `EntityAlreadyExists`. Planning looks in the account, or asks; either
+ * way the answer is recorded in the plan and this reads it.
+ */
 function buildPipeline(manifest) {
   const { pipeline } = manifest;
-  return pipeline.target === 'github-actions'
-    ? { target: 'github-actions', branch: pipeline.branch, repository: pipeline.repository }
-    : { target: pipeline.target, branch: pipeline.branch };
+  if (pipeline.target !== 'github-actions') {
+    return { target: pipeline.target, branch: pipeline.branch };
+  }
+
+  const provider = resource(manifest, 'github-oidc-provider');
+  if (!provider || provider.action === 'skip') {
+    fail(
+      "plan.resources: the pipeline target is github-actions but there is no 'github-oidc-provider' " +
+        'entry. Look for one in the account with `aws iam list-open-id-connect-providers`, or ask — ' +
+        'do not leave it undecided, because the generated stack would create a second provider and ' +
+        'fail with EntityAlreadyExists on any account that already has one.',
+    );
+  }
+  if (provider.action === 'adopt' && !provider.identifiers?.providerArn) {
+    fail(
+      "plan.resources: the 'github-oidc-provider' entry is marked adopt but records no providerArn.",
+    );
+  }
+
+  return {
+    target: 'github-actions',
+    branch: pipeline.branch,
+    repository: pipeline.repository,
+    oidcProvider:
+      provider.action === 'adopt'
+        ? { mode: 'adopt', providerArn: provider.identifiers.providerArn }
+        : { mode: 'create' },
+  };
 }
 
 function buildConfig(manifest) {

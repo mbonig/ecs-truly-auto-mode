@@ -141,6 +141,12 @@ plan:
     - id: github-oidc-role
       action: create
       reason: Pipeline target is github-actions
+    - id: github-oidc-provider
+      action: adopt
+      identifiers:
+        providerArn: arn:aws:iam::071128183726:oidc-provider/token.actions.githubusercontent.com
+      reason: Account already has a provider for token.actions.githubusercontent.com
+      validated: true
 
 pipeline:
   target: github-actions

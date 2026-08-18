@@ -38,6 +38,7 @@ Not alphabetical, not by resource type. Ordered by what it costs to get wrong:
 
   certificate     An ACM certificate for orders.example.com
                   Need: certificate ARN in us-east-1
+                  Or `create` — issued and DNS-validated in the zone below
 
   hosted-zone     The public zone for example.com
                   Need: hosted zone ID
@@ -114,6 +115,26 @@ mentioning it changes a decision.
 
 **Name what was skipped and why.** A silently-absent certificate looks identical to a
 forgotten one.
+
+**Do not present a resource as needing an identifier when it can be created.** The
+certificate is the one that gets this wrong: adopting an already-issued one is often
+convenient, but it is a choice, not a prerequisite. Whenever `hosted-zone` is adopted,
+show `create` alongside the ARN as a real option — the certificate is issued by the
+platform stack and DNS-validated in that zone, so nothing has to exist in AWS first.
+
+**Show a decision the skill already made, and how it made it.** The GitHub OIDC
+provider is normally answered by looking in the account rather than by asking, so it
+belongs in the plan as a stated decision rather than a question:
+
+```
+  github-oidc-provider   adopt — found in this account
+                         arn:aws:iam::071128183726:oidc-provider/token.actions.githubusercontent.com
+```
+
+or, when the account could not be reached, as one of the few questions worth asking
+outright — because guessing it wrong fails the first deploy in one direction or the
+first pipeline run in the other. See
+[adopt-validation.md](./adopt-validation.md#github-oidc-provider).
 
 ## Approval
 

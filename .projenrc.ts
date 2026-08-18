@@ -192,9 +192,13 @@ project.addTask('skills:materialize', {
   exec: 'node scripts/materialize-skills.mjs',
 });
 
+// W2001: an SSM-backed parameter the service stack does not reference directly.
+// W3005: a redundant DependsOn that aws-cdk-lib's custom-resource framework emits for
+//        the GitHub OIDC provider's handler role. It comes from the library, not from
+//        the templates here, so there is nothing to fix in the generated output.
 project.addTask('lint:cfn', {
   description: 'Lint synthesized CloudFormation templates',
-  exec: "cfn-lint --ignore-checks W2001 'templates/cdk/cdk.out/*.template.json'",
+  exec: "cfn-lint --ignore-checks W2001,W3005 'templates/cdk/cdk.out/*.template.json'",
 });
 
 project.addTask('derive:filter', {

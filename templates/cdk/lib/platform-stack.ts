@@ -29,7 +29,16 @@ import { GitHubOidcRole } from './deploy-permissions';
 export interface PlatformStackGitHubActions {
   readonly repository: string;
   readonly branch: string;
-  /** Set when the account already has a GitHub OIDC provider; creating a second fails. */
+  /**
+   * Set when the plan recorded that this account already has an OIDC provider for
+   * `token.actions.githubusercontent.com` — creating a second fails with
+   * `EntityAlreadyExists`. Absent means the plan recorded that the account has none,
+   * and one is created here.
+   *
+   * The entry point maps this from `pipeline.oidcProvider`, which is a decision, not
+   * an optional value: nothing reaches this prop without planning having looked in the
+   * account or asked.
+   */
   readonly existingProviderArn?: string;
 }
 
@@ -393,14 +402,13 @@ export class PlatformStack extends cdk.Stack {
       albSecurityGroup = alb.connections.securityGroups[0];
 
       if (this.config.publicHostname) {
-        const certificate = acm.Certificate.fromCertificateArn(
-          this,
-          'Certificate',
-          this.config.publicHostname.certificateArn,
-        );
+        // Imported once and shared. The zone is needed twice — to validate a created
+        // certificate and to hold the alias record — and importing it under two
+        // construct IDs would read as two zones in the tree.
+        const zone = this.importHostedZone();
         listener = alb.addListener('HttpsListener', {
           port: 443,
-          certificates: [certificate],
+          certificates: [this.buildCertificate(zone)],
           open: true,
         });
         // Redirect rather than serving plaintext on 80.
@@ -409,7 +417,7 @@ export class PlatformStack extends cdk.Stack {
           open: true,
           defaultAction: elbv2.ListenerAction.redirect({ protocol: 'HTTPS', port: '443', permanent: true }),
         });
-        this.buildDnsRecord(alb);
+        this.buildDnsRecord(alb, zone);
       } else {
         listener = alb.addListener('HttpListener', { port: 80, open: true });
       }
@@ -483,12 +491,44 @@ export class PlatformStack extends cdk.Stack {
     return targetGroup;
   }
 
-  private buildDnsRecord(alb: elbv2.ApplicationLoadBalancer): void {
-    const { hostname, hostedZoneId, zoneName } = this.config.publicHostname!;
-    const zone = route53.HostedZone.fromHostedZoneAttributes(this, 'HostedZone', {
+  /**
+   * Attributes, never `fromLookup` — synth must work without credentials. The zone is
+   * always adopted: creating one means delegating nameservers at a registrar, which is
+   * outside what this tool can verify.
+   */
+  private importHostedZone(): route53.IHostedZone {
+    const { hostedZoneId, zoneName } = this.config.publicHostname!;
+    return route53.HostedZone.fromHostedZoneAttributes(this, 'HostedZone', {
       hostedZoneId,
       zoneName,
     });
+  }
+
+  /**
+   * Created DNS-validated, or imported by ARN.
+   *
+   * On the create path CloudFormation's own ACM resource writes the validation record
+   * into the zone and waits for issuance, so no custom resource and no extra IAM are
+   * involved. The cost is that the platform stack's first deploy blocks until ACM
+   * issues — and if the zone is not the one actually serving the hostname, it blocks
+   * until the stack times out rather than failing fast. Planning checks the hostname
+   * against the zone name for exactly that reason.
+   */
+  private buildCertificate(zone: route53.IHostedZone): acm.ICertificate {
+    const { hostname, certificate } = this.config.publicHostname!;
+
+    if (certificate.mode === 'adopt') {
+      return acm.Certificate.fromCertificateArn(this, 'Certificate', certificate.certificateArn);
+    }
+
+    return new acm.Certificate(this, 'Certificate', {
+      domainName: hostname,
+      validation: acm.CertificateValidation.fromDns(zone),
+    });
+  }
+
+  private buildDnsRecord(alb: elbv2.ApplicationLoadBalancer, zone: route53.IHostedZone): void {
+    const { hostname } = this.config.publicHostname!;
     new route53.ARecord(this, 'AliasRecord', {
       zone,
       recordName: hostname,

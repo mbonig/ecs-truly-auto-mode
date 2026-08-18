@@ -195,7 +195,7 @@
       "description": "Lint synthesized CloudFormation templates",
       "steps": [
         {
-          "exec": "cfn-lint --ignore-checks W2001 'templates/cdk/cdk.out/*.template.json'"
+          "exec": "cfn-lint --ignore-checks W2001,W3005 'templates/cdk/cdk.out/*.template.json'"
         }
       ]
     },

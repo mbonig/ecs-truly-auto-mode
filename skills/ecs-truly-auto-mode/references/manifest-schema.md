@@ -207,6 +207,23 @@ plan:
 A plan containing any `adopt` entry with missing identifiers is **incomplete**, and
 generation does not run regardless of `approved`.
 
+Identifiers are shape-checked per resource by the resource catalog rather than by the
+JSON Schema, which only requires that an adopted entry carries at least one. Two
+entries are worth calling out because a missing decision on either produces a deploy
+failure rather than a generation failure:
+
+| Entry | `create` means | `adopt` identifiers |
+| --- | --- | --- |
+| `certificate` | Issue a DNS-validated certificate against the adopted hosted zone. Requires `hosted-zone` to be `adopt`. | `certificateArn` |
+| `github-oidc-provider` | The target account has no provider for `token.actions.githubusercontent.com`, so create one. | `providerArn` |
+
+The `github-oidc-provider` entry is **required** when `pipeline.target` is
+`github-actions`. It is not optional and it does not default: the generated role
+creates a provider when handed no ARN, and most accounts already have one, so an
+absent entry is a first deploy that fails with `EntityAlreadyExists`. Planning decides
+it by looking in the account, and asks when it cannot look — see
+[adopt-validation.md](./planning/adopt-validation.md#github-oidc-provider).
+
 ## `pipeline` (object, required)
 
 | Field | Type | Notes |

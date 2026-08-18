@@ -149,6 +149,54 @@ const consistencyChecks = [
     return problems;
   },
 
+  function githubActionsRecordsAnOidcProviderDecision(m) {
+    if (m.pipeline?.target !== 'github-actions') return [];
+    const provider = findResource(m, 'github-oidc-provider');
+    if (!provider || provider.action === 'skip') {
+      return ['pipeline.target is "github-actions" but plan resource "github-oidc-provider" is missing or skipped — the generated role creates a provider when it is handed none, and most accounts already have one, so an undecided entry is a first deploy that fails with EntityAlreadyExists'];
+    }
+    if (provider.action === 'adopt' && !provider.identifiers?.providerArn) {
+      return ['plan resource "github-oidc-provider" is adopted but records no providerArn'];
+    }
+    return [];
+  },
+
+  function publicHostnameCarriesZoneAndCertificate(m) {
+    const dns = findResource(m, 'dns-record');
+    if (!dns || dns.action === 'skip') return [];
+
+    const problems = [];
+    const zone = findResource(m, 'hosted-zone');
+    if (zone?.action !== 'adopt') {
+      problems.push(`plan resource "dns-record" is "${dns.action}" but "hosted-zone" is ${zone ? `"${zone.action}"` : 'missing'} — a public hostname needs an adopted zone to hold the record, and the skill does not create hosted zones`);
+    }
+
+    const cert = findResource(m, 'certificate');
+    if (!cert || cert.action === 'skip') {
+      problems.push(`plan resource "dns-record" is "${dns.action}" but "certificate" is ${cert ? `"${cert.action}"` : 'missing'} — serving the hostname over HTTPS needs a certificate created or adopted`);
+    } else if (cert.action === 'create' && zone?.action !== 'adopt') {
+      problems.push('plan resource "certificate" is "create" but no hosted zone is adopted — a created certificate is DNS-validated, and the validation record has to go somewhere');
+    }
+
+    return problems;
+  },
+
+  function createdCertificateIsCoveredByTheAdoptedZone(m) {
+    const cert = findResource(m, 'certificate');
+    if (cert?.action !== 'create') return [];
+    const zoneName = findResource(m, 'hosted-zone')?.identifiers?.zoneName;
+    const hostname = m.analysis?.hostnames?.public?.[0]?.value;
+    if (!zoneName || !hostname) return [];
+
+    // A certificate validated against a zone that is not authoritative for the name
+    // never issues, and CloudFormation waits on it until the stack times out rather
+    // than failing — so this is worth catching in the manifest.
+    if (hostname !== zoneName && !hostname.endsWith(`.${zoneName}`)) {
+      return [`plan resource "certificate" is "create" for "${hostname}", but the adopted hosted zone is "${zoneName}" — DNS validation writes its record into that zone, so the certificate would never issue and the platform stack would block until it timed out`];
+    }
+    return [];
+  },
+
   function pipelineFilterCoversBuildContext(m) {
     const contextPaths = m.analysis?.buildContextPaths ?? [];
     const filter = m.pipeline?.pathFilter ?? [];

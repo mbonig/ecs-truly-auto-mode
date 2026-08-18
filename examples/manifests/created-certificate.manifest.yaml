@@ -1,17 +1,22 @@
-# Example manifest: a stateless Node/Express API with no outbound calls that leave
-# the VPC. Everything is created from scratch. This is the case that gets isolated
-# subnets and no NAT gateway.
+# Example manifest: the same stateless API as created-vpc, but served on a public
+# hostname whose certificate is *created* rather than adopted.
+#
+# This is the manifest that pins down the create path for both resources that used
+# to have only one: the ACM certificate is issued by the platform stack, DNS-validated
+# against an adopted hosted zone, and the GitHub OIDC provider is created because the
+# account has none. Nothing has to exist in AWS before the first platform deploy except
+# the hosted zone, which the skill never creates.
 schemaVersion: 1
 
 app:
-  name: hello-api
+  name: shop-api
   dockerfile: Dockerfile
   buildContext: .
 
 target:
   account: '071128183726'
   region: us-east-1
-  ssmPrefix: /ecs-auto-mode/hello-api
+  ssmPrefix: /ecs-auto-mode/shop-api
 
 analysis:
   buildValidated: true
@@ -73,7 +78,14 @@ analysis:
     externalHosts: []
 
   hostnames:
-    public: []
+    public:
+      - value: shop.example.com
+        confidence: high
+        confirmedByUser: true
+        evidence:
+          - file: README.md
+            line: 3
+            excerpt: 'Production: https://shop.example.com'
     internal: []
 
   datastores: []
@@ -112,7 +124,7 @@ plan:
       reason: No existing repository supplied
     - id: load-balancer
       action: create
-      reason: Service accepts inbound HTTP on port 8080
+      reason: Service accepts inbound HTTP on port 8080; internet-facing because a public hostname is recorded
     - id: target-group
       action: create
       reason: Required by the load balancer listener
@@ -125,27 +137,32 @@ plan:
     - id: execution-role
       action: create
       reason: Required to pull the image and write logs
+    - id: hosted-zone
+      action: adopt
+      identifiers:
+        hostedZoneId: Z0123456789ABCDEFGHIJ
+        zoneName: example.com
+      reason: The skill does not create hosted zones — delegating nameservers at a registrar is outside what it can verify
+      validated: true
     - id: certificate
-      action: skip
-      reason: No public hostname recorded — listener serves HTTP only
+      action: create
+      reason: No certificate exists for shop.example.com; issued DNS-validated against the adopted zone rather than requiring one to exist before the first deploy
     - id: dns-record
-      action: skip
-      reason: No public hostname recorded
+      action: create
+      reason: Alias record for shop.example.com into the adopted zone
     - id: github-oidc-role
       action: create
       reason: Pipeline target is github-actions
     - id: github-oidc-provider
-      action: adopt
-      identifiers:
-        providerArn: arn:aws:iam::071128183726:oidc-provider/token.actions.githubusercontent.com
-      reason: Account already has a provider for token.actions.githubusercontent.com — creating a second fails
+      action: create
+      reason: aws iam list-open-id-connect-providers returned no GitHub provider in this account
       validated: true
 
 pipeline:
   target: github-actions
   branch: main
-  repository: mbonig/hello-api
-  roleArn: arn:aws:iam::071128183726:role/hello-api-deploy
+  repository: mbonig/shop-api
+  roleArn: arn:aws:iam::071128183726:role/shop-api-deploy
   pathFilter:
     - src/**
     - package.json
@@ -153,14 +170,3 @@ pipeline:
     - tsconfig.json
     - Dockerfile
     - infra/lib/service-stack.ts
-
-generated:
-  - path: infra/lib/platform-stack.ts
-    sha256: a40ee72384d1a08bdd32b9944b00d2ff74931f692573a33c301714668e5b83c4
-    section: plan.resources
-  - path: infra/lib/service-stack.ts
-    sha256: 5b0cd598f946fb83b83306fc22f04a7c0368bf13c390b892d6afd638f0615924
-    section: analysis.container
-  - path: .github/workflows/deploy.yml
-    sha256: 9cef5a1492a22bf6cb0808463f1c6f9e744c70ccd614a27abc9c0ed608841ade
-    section: pipeline

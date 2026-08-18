@@ -61,6 +61,9 @@ your Dockerfile.
   vpc, vpc-endpoints, cluster, ecr-repository, load-balancer, target-group,
   log-group, task-role, execution-role, security groups, github-oidc-role
 
+### Will be adopted (1)
+  github-oidc-provider   found in this account -- a second one cannot be created
+
 ### Will be skipped (3)
   nat-gateway     egress is none
   certificate     no public hostname recorded
@@ -73,6 +76,11 @@ your Dockerfile.
 
 The egress decision leads because it is the one that costs money and the one least
 likely to be noticed in a list. Nothing is generated until you approve.
+
+The OIDC provider was not a question: the account was checked, one was already there,
+so it is adopted rather than created. Had the account had none, one would be created.
+That check is worth knowing about because both wrong answers fail the first deploy —
+see [adopting existing resources](./adopting-resources.md).
 
 Two questions come with the plan, and neither depends on the analysis: which pipeline
 to generate, and what shape the CDK project should take — a **plain** CDK app, or a

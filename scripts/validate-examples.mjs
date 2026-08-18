@@ -208,6 +208,50 @@ const corruptions = [
     break: (m) => { delete m.infra.cdkVersion; },
     expect: 'cdkVersion',
   },
+  {
+    name: 'github-actions target with no OIDC provider decision',
+    base: 'created-vpc',
+    break: (m) => {
+      m.plan.resources = m.plan.resources.filter((r) => r.id !== 'github-oidc-provider');
+    },
+    expect: 'EntityAlreadyExists',
+  },
+  {
+    name: 'adopted OIDC provider with no ARN to trust',
+    base: 'created-vpc',
+    break: (m) => {
+      // Not a missing `identifiers` — the schema already catches that. This is the
+      // shape a half-finished session leaves: an identifier, just not the one needed.
+      m.plan.resources.find((r) => r.id === 'github-oidc-provider').identifiers = {
+        providerUrl: 'token.actions.githubusercontent.com',
+      };
+    },
+    expect: 'records no providerArn',
+  },
+  {
+    name: 'public hostname with no hosted zone to hold the record',
+    base: 'created-certificate',
+    break: (m) => {
+      m.plan.resources = m.plan.resources.filter((r) => r.id !== 'hosted-zone');
+    },
+    expect: 'does not create hosted zones',
+  },
+  {
+    name: 'public hostname whose certificate was skipped',
+    base: 'created-certificate',
+    break: (m) => {
+      m.plan.resources.find((r) => r.id === 'certificate').action = 'skip';
+    },
+    expect: 'needs a certificate created or adopted',
+  },
+  {
+    name: 'certificate created against a zone that does not cover it',
+    base: 'created-certificate',
+    break: (m) => {
+      m.plan.resources.find((r) => r.id === 'hosted-zone').identifiers.zoneName = 'elsewhere.com';
+    },
+    expect: 'would never issue',
+  },
 ];
 
 function main() {

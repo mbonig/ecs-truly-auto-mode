@@ -18,13 +18,44 @@ environment-dependent and write a `cdk.context.json` that goes stale.
 | `ecr-repository` | `repositoryName`, `repositoryUri` |
 | `load-balancer` | `loadBalancerArn`, `securityGroupId`, `listenerArn`, and `listenerRuleHostHeader` if the listener is shared |
 | `target-group` | `targetGroupArn` |
-| `certificate` | `certificateArn` (same region as the ALB) |
+| `certificate` | `certificateArn` (same region as the ALB) — or create it, see below |
 | `hosted-zone` | `hostedZoneId`, `zoneName` |
 | `database` | `dbInstanceIdentifier`, `endpointAddress`, `port`, `securityGroupId` |
 | `cache` | `cacheClusterId`, `endpointAddress`, `port`, `securityGroupId` |
 | Buckets / tables / queues / topics | `bucketName` / `tableName` / `queueUrl` / `topicArn` |
 | `github-oidc-role` | `roleArn` |
+| `github-oidc-provider` | `providerArn` |
 | `codeconnection` | `connectionArn` (must already be `AVAILABLE`) |
+
+## The certificate does not have to exist first
+
+A certificate is created or adopted like anything else. If you already have one that
+covers the hostname, adopt it. If you don't, the platform stack issues one,
+DNS-validated against your hosted zone — you don't need to go and make one first.
+
+Two things follow from that:
+
+- **Creating requires an adopted hosted zone**, because validation writes a record
+  into it. The skill doesn't create zones (below), so with no zone the certificate has
+  to be adopted.
+- **The first platform deploy blocks until ACM issues the certificate**, usually a
+  couple of minutes. If the zone isn't the one actually serving the hostname, it never
+  issues and the stack sits there until it times out rather than failing — which is why
+  the hostname is checked against the zone name before the plan is accepted.
+
+## The GitHub OIDC provider is decided by looking
+
+For a GitHub Actions pipeline, AWS needs an OIDC provider for
+`token.actions.githubusercontent.com`. Most accounts already have one, and a second
+cannot be created — the deploy fails with `EntityAlreadyExists`. Accounts that have
+none need one.
+
+So the skill checks your account rather than guessing, and records what it found. If it
+can't reach the account, it asks — and a failed check is never read as "there isn't
+one", because those two situations need opposite actions.
+
+An adopted provider is used as-is. Its thumbprints and client IDs stay yours; the skill
+only reads the ARN.
 
 ## Resources that can only be adopted
 
@@ -53,9 +84,11 @@ Checks worth knowing about because they catch real mistakes:
   private but actually isolated (or vice versa) is the worst failure in this whole
   area: everything deploys successfully and the service silently has — or lacks —
   internet access.
-- **Certificates must be `ISSUED`, not `PENDING_VALIDATION`**, and in the ALB's
-  region. A `us-east-1` certificate created for CloudFront is a common thing to have
-  lying around and a common thing to reach for by mistake.
+- **Certificates you adopt must be `ISSUED`, not `PENDING_VALIDATION`**, and in the
+  ALB's region. A `us-east-1` certificate created for CloudFront is a common thing to
+  have lying around and a common thing to reach for by mistake. (A certificate the
+  stack creates is checked differently — the hostname has to sit inside the zone that
+  will validate it.)
 - **`*.example.com` does not cover `example.com`** itself, or `a.b.example.com`.
 - **S3 `head-bucket` distinguishes 404 from 403.** Bucket names are globally unique,
   so a typo can land on a stranger's bucket.

@@ -95,6 +95,19 @@ Never flip this silently. It changes both cost and reachability.
 the reason. The entry is a record of a decision, and the underlying resource may
 still exist and still be billing.
 
+**A create-or-adopt action flipped** — say what happens to the resource that already
+exists, because CloudFormation will not mention it. Two are worth stating outright:
+
+- `certificate`, `adopt` → `create`: a second certificate is issued for the same
+  domain. ACM allows this and the old one costs nothing, so the result is confusing
+  rather than harmful — but the adopted certificate is now unused and nothing will
+  ever tell you.
+- `github-oidc-provider`, `create` → `adopt`: the stack stops managing the provider it
+  created and trusts the recorded one instead. It does not delete the old one, and an
+  account cannot hold two providers for the same URL — so if the ARN being adopted *is*
+  the one this stack created, this is just a change of ownership, and if it is not, one
+  of the two is wrong.
+
 ## Adopted resources
 
 Do not re-validate identifiers that are unchanged and already `validated: true`.

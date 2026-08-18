@@ -168,6 +168,19 @@ not a conversion. Nothing converts an existing `infra/` in place: the new layout
 written and the overwrite check guards everything already on disk. Say that plainly
 rather than half-converting a directory.
 
+**Re-running against a manifest generated before the certificate and OIDC provider
+became create-or-adopt** rewrites `config.ts` and `app-config.ts` together, because the
+types changed: `PublicHostname.certificateArn` became `certificate`, and the
+`github-actions` variant of `PipelineConfig` gained a required `oidcProvider`. Both
+files are the skill's, and it always writes them as a pair, so there is nothing to
+migrate by hand. A hand-edited `app-config.ts` is caught by the ordinary overwrite check
+before either is written — which is the case worth noticing, because the symptom of
+regenerating only one of them is a type error rather than a diff.
+
+The manifest needs a `github-oidc-provider` plan entry before it can be regenerated for
+the `github-actions` target. Generation stops and says so rather than defaulting; older
+manifests predate the entry, so this is expected on the first re-run.
+
 **Re-running against a manifest generated before the ECS service was given a
 deterministic `serviceName`** replaces the `AWS::ECS::Service` on the next deploy —
 `serviceName` is immutable, so CloudFormation cannot update it in place. Say so before
