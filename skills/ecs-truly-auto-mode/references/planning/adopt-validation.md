@@ -222,6 +222,40 @@ Record the cluster endpoint, port and security group. A `mongodb+srv://` URI is 
 DocumentDB cluster and there is nothing to look up — it is an external service, and the
 question it raises is the egress classification.
 
+### DSQL cluster
+
+```bash
+aws dsql list-clusters --region <region>
+```
+
+On a match, record `arn` and `identifier`, and — only when `egress.classification` is
+`none` — the region's DSQL **data-plane** endpoint service name, which is not
+returned per-cluster and needs its own lookup:
+
+```bash
+aws ec2 describe-vpc-endpoint-services --region <region> \
+  --filters "Name=service-name,Values=*dsql*" \
+  --query 'ServiceDetails[?contains(ServiceName,`dsql-`)].ServiceName'
+```
+
+Record the result as `vpcEndpointServiceName`. Do **not** record a `securityGroupId`
+— DSQL has none, and recording one produces a finding the validator rejects.
+
+On no match, `create` is available. Two things to say in the plan, because DSQL
+inverts the usual database warnings: it is **not** retained-and-slow like RDS — it
+provisions in about 30 seconds — but it **is** still retained and deletion-protected
+on stack deletion, the same asymmetry as every other created datastore.
+
+**Availability is a separate question from permission, and the two produce opposite
+correct answers.** `list-clusters` returning `AccessDeniedException` naming an
+**explicit deny in a service control policy** means the organization has
+administratively blocked DSQL in that region — not that DSQL is unavailable there.
+Report the distinction: "DSQL is not available in this region" and "your
+organization's SCP blocks DSQL in this region" send the user to different next steps,
+a support ticket versus a conversation with a cloud administrator. Treat a denied
+call the same way the [GitHub OIDC provider check](#github-oidc-provider) treats one
+— never read it as absence.
+
 ### S3 bucket
 
 ```bash

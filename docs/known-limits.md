@@ -77,8 +77,8 @@ Not covered, and not planned:
   and asks rather than silently deploying only the web process.
 - **Fixing a Dockerfile that doesn't build.** The run stops and reports.
 - **Creating hosted zones or secrets, and Aurora clusters.** Adopt-only, for reasons in
-  [adopting resources](./adopting-resources.md). Databases, caches, tables, buckets,
-  queues and topics *can* be created — with the limits below.
+  [adopting resources](./adopting-resources.md). Databases, caches, DSQL clusters,
+  tables, buckets, queues and topics *can* be created — with the limits below.
 - **Schema migrations.** A created database comes up empty. The skill does not generate a
   migration step and the pipeline does not run one, so a repository with a `migrations/`
   directory still needs that wired up. This is the gap between a deploy that succeeds and
@@ -150,6 +150,36 @@ Skipping it produces tasks that start, log that they are listening, fail every h
 check, and are killed with exit code 137 — a symptom that looks like an application
 bug and is not.
 
+**Aurora DSQL's isolated-egress path (`egress: none`) is less verified than the
+public path.** Connecting over the VPC data-plane endpoint has not been exercised
+end-to-end, and it is not confirmed whether the certificate DSQL presents there
+covers the `<id>.dsql-<suffix>.<region>.on.aws` hostname the way it covers the
+public `<id>.dsql.<region>.on.aws` form. If `sslmode=verify-full` fails against the
+isolated endpoint after everything else in the plan looks correct, this is the first
+thing to check. The region-specific data-plane endpoint suffix (observed as
+`dsql-fnh4` in `us-east-1` only) is resolved at synth or plan time rather than
+hardcoded for exactly this reason — see
+[egress.md](../skills/ecs-truly-auto-mode/references/analysis/egress.md).
+
+**A libpq-based driver needs an explicit CA bundle path in a slim image.** Not
+specific to DSQL — any `sslmode=verify-full` connection from `psycopg`, `psycopg2`,
+`ruby-pg`, `pdo_pgsql`, or `psql` in a Debian/Ubuntu-slim container hits it, because
+libpq's default trust-path resolution (`~/.postgresql/root.crt`, then OpenSSL's
+hashed-symlink `system` mode) doesn't work in a minimal image even though the CA
+bundle is present and correct. The failure mode is worse than a crash: an
+application that catches the error and reports healthy anyway passes its ALB health
+check while never reaching its database. `/etc/ssl/certs/ca-certificates.crt` is the
+verified path for Debian-family images; Alpine, distroless, and RHEL-family paths
+are conventional but not verified here.
+
+**The IAM grant on the task role is necessary but not sufficient for DSQL.** It
+authorises the connection attempt; a database role still has to be linked to that
+IAM principal from inside the cluster with `AWS IAM GRANT`, which cannot run as part
+of `cdk deploy` because the task role's ARN doesn't exist until after the platform
+stack deploys. This is manual, one-time work — see
+[resource-catalog.md](../skills/ecs-truly-auto-mode/references/planning/resource-catalog.md#dsql-cluster)
+for the exact statements.
+
 ## Security posture
 
 - Secret **values** are never read or recorded. Only names and pointers.
@@ -159,6 +189,9 @@ bug and is not.
 - A created database's credentials are generated in Secrets Manager and never pass
   through a template. The stack that owns the secret grants the execution role read on
   **that secret alone**, so no wildcard grant is written and no ARN has to be supplied.
+- Aurora DSQL has no password anywhere in the system. The driver authenticates with a
+  short-lived SigV4 token signed by the task role, scoped to the cluster's own ARN —
+  there is no secret to generate, adopt, or grant read on.
 - The GitHub OIDC trust policy is scoped to `repo:<owner>/<repo>:*`. Without that
   condition it could be assumed from any repository on GitHub — an account
   compromise, not a misconfiguration.

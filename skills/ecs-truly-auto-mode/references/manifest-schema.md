@@ -114,22 +114,32 @@ analysis:
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `kind` | `rds` \| `dynamodb` \| `elasticache` \| `documentdb` \| `s3` \| `sqs` \| `sns` \| `other` | `other` is adopt-only: the skill cannot create what it could not identify. |
+| `kind` | `rds` \| `dynamodb` \| `elasticache` \| `documentdb` \| `s3` \| `sqs` \| `sns` \| `dsql` \| `other` | `other` is adopt-only: the skill cannot create what it could not identify. |
 | `engine` | string | For `rds`: `postgres`, `mysql`, etc. An `aurora-*` engine is adopt-only. |
 | `evidence` | array | Supporting evidence. |
 | `confidence` | see below | |
-| `iamActions` | array of string | Actions granted to the task role. Empty for network-reached stores like RDS. |
+| `iamActions` | array of string | Actions granted to the task role. Empty for network-reached stores like RDS; `dsql:DbConnect`/`DbConnectAdmin` for `dsql`. |
+| `dbUser` | string | `dsql` only. The database role the app logs in as; `admin` needs `dsql:DbConnectAdmin`, absent defaults to `admin`. |
+| `endpointEnvVar` | string | `dsql` only. The env var the container reads the endpoint from. |
 | `planId` | string | **The entry in `plan.resources` this datastore is decided by.** |
 | `nameFound` | boolean | Whether a name exists to look up in the account. |
 | `schema` | object | A table's key shape. Required before `create`. |
-| `connection` | object | How a network-reached store is reached. Required before `create`. |
+| `connection` | object | How a network-reached store is reached. Required before `create`. Not used by `dsql` — see below. |
 | `attributeVariables` | array of `{name, attribute}` | Environment variables carrying an API-reached resource's name. |
 
 `planId` is the link between a finding and its create-or-adopt decision, and it is not
-optional. The network-reached kinds map onto fixed ids (`database`, `cache`), but an
-API-reached entry's id names its role — `receipts-bucket`, `sessions-table` — so two
-buckets are indistinguishable without it. An adopted entry could once be matched by its
-identifiers; a created one has none.
+optional. The network-reached kinds map onto fixed ids (`database`, `cache`), and `dsql`
+onto `dsql-cluster` for the same reason, but an API-reached entry's id names its role —
+`receipts-bucket`, `sessions-table` — so two buckets are indistinguishable without it. An
+adopted entry could once be matched by its identifiers; a created one has none.
+
+`dsql` is neither network-reached nor API-reached: it has a port and an endpoint like
+the former, but no security group and no password like the latter — see
+[datastores.md](./analysis/datastores.md#iam-authenticated-network-datastores). It
+carries no `connection` block because there is no secret to decompose into fields; its
+endpoint is a literal in `config.environment` when adopted (known at plan time), or
+published from SSM when created (a deploy-time value), named by `endpointEnvVar` either
+way.
 
 `nameFound` decides which branch planning takes: `true` runs one targeted account lookup,
 `false` means there is nothing to look up, so the entry is asked about rather than the

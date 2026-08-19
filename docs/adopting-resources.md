@@ -22,6 +22,7 @@ environment-dependent and write a `cdk.context.json` that goes stale.
 | `hosted-zone` | `hostedZoneId`, `zoneName` |
 | `database` (RDS or DocumentDB) | `dbInstanceIdentifier`, `endpointAddress`, `port`, `securityGroupId` — or create it, see below |
 | `cache` (ElastiCache) | `cacheClusterId`, `endpointAddress`, `port`, `securityGroupId` — or create it |
+| `dsql-cluster` (Aurora DSQL) | `clusterIdentifier`, `endpoint`, plus `vpcEndpointServiceName` if egress is `none` — or create it, see below |
 | Buckets / tables / queues / topics | `bucketName` / `tableName` / `queueUrl` / `topicArn` — or create them |
 | `github-oidc-role` | `roleArn` |
 | `github-oidc-provider` | `providerArn` |
@@ -86,6 +87,21 @@ all of these before you approve it:
 - **A created table's key schema cannot be changed.** So the skill refuses to create one
   unless the key schema was read from your code at high confidence or you confirmed it.
   This is the only datastore decision that cannot be revised later.
+
+### Aurora DSQL is unusually cheap to create, and different in two ways worth knowing
+
+DSQL is serverless with no capacity or version to choose, so creating one is a
+30-second operation — not the tens-of-minutes wait RDS or DocumentDB take, even
+though the retention and deletion-protection asymmetry above still applies to it.
+
+It also differs from every other datastore here in a way that removes a step rather
+than adding one: **DSQL has no security group and no generated secret.** There is
+nothing to adopt or create for either, and the driver authenticates with a
+short-lived IAM token instead of a password. The one thing that *is* still on you:
+the IAM grant only authorises the connection attempt, and DSQL separately needs a
+database role linked to that IAM principal, created with SQL run against the cluster
+after it exists. The plan states the exact statements — see
+[known-limits.md](./known-limits.md).
 
 ### If your app reads a single DATABASE_URL
 

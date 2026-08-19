@@ -1,16 +1,22 @@
 # Datastore analysis
 
-Datastores split into two kinds, and the distinction drives everything downstream:
+Datastores split into three kinds, and the distinction drives everything downstream:
 
 - **Network-reached** (RDS, ElastiCache, DocumentDB) — connected to over TCP with
   credentials. Needs a **security group rule** and a **secret**. IAM grants nothing.
 - **API-reached** (DynamoDB, S3, SQS, SNS) — called through the AWS SDK. Needs
   **task role permissions** and, in isolated subnets, a **VPC endpoint**. No security
   group rule, no credentials.
+- **IAM-authenticated network** (Aurora DSQL) — reached over TCP like a database, but
+  authorised by IAM like an API. Needs **task role permissions** and no security
+  group at all: DSQL is regional and serverless, with no ENI in any VPC.
 
 Getting this backwards produces a confusing failure: an IAM policy for RDS that
 grants nothing, or a security group rule for DynamoDB that does nothing, while the
-actual missing piece goes unnoticed.
+actual missing piece goes unnoticed. The third category exists because DSQL cannot be
+expressed as either of the first two without lying: it has a port and an endpoint like
+a network-reached store, but no security group and no password like an API-reached
+one.
 
 See [ecosystems](./ecosystems.md) for the per-language dependency signals. This
 document covers what each detected datastore *implies*.
@@ -207,15 +213,72 @@ because a queue without one silently discards what it cannot process; a topic ge
 nothing but a name. Both are retained. Record the variable holding the queue URL or the
 topic ARN — a created queue's URL is a deploy-time value.
 
+## IAM-authenticated network datastores
+
+### Aurora DSQL
+
+**Signals:** a PostgreSQL driver dependency (`psycopg`, `asyncpg`, `pg`, `pgx`) plus
+any of: `boto3.client("dsql")` / `DsqlSigner` / a `generate_db_connect_auth_token`
+call, a `*.dsql.*.on.aws` hostname (or a regex matching one), or a `DSQL_`-prefixed
+env var. Driver **and** token-generation call together is `high` confidence — they
+are independent signals. A PostgreSQL driver alone is not enough on its own; RDS
+PostgreSQL is far more common and looks identical from the driver alone.
+
+**Implies:**
+
+- Task role permissions — `dsql:DbConnect` for a named database role,
+  `dsql:DbConnectAdmin` for `admin` — on
+  `arn:aws:dsql:<region>:<account>:cluster/<cluster-id>`.
+- **No security group rule.** DSQL is regional and serverless — no ENI in the VPC, no
+  security group to adopt or create.
+- **No secret, in either direction.** The driver authenticates with a short-lived
+  SigV4 token signed by the task role. Recording a secret for it is a bug, not a gap.
+- Port 5432, PostgreSQL wire protocol, default database `postgres`.
+- Egress: DSQL has an interface endpoint for its data plane, so it does **not** force
+  `public` — see [egress.md](./egress.md#aws-services-to-vpc-endpoints). "The app uses
+  `boto3.client('dsql')`, therefore it needs NAT" is exactly the wrong inference this
+  tool exists to avoid.
+
+**Adopting:** collect `clusterIdentifier` and `endpoint`, keyed on any recorded
+cluster identifier, same lookup-first procedure as the other datastores — see
+[adopt-validation](../planning/adopt-validation.md#dsql-cluster). When
+`egress.classification` is `none`, also resolve `vpcEndpointServiceName`: the
+certificate DSQL presents on the public endpoint does not cover the VPC-endpoint
+hostname, so the isolated form has to be resolved and recorded rather than assumed.
+
+**Creating:** asks nothing. DSQL is serverless with no capacity or version to choose,
+which is what makes offering `create` here defensible — unlike RDS or DocumentDB,
+provisioning takes about 30 seconds, not tens of minutes. A created cluster is
+retained on stack deletion and deletion-protected, same asymmetry as a created
+database.
+
+**Record the database role and the endpoint variable.** `dbUser` names the role the
+application logs in as (`admin` by default, or a least-privilege role) and decides
+which action to grant. `endpointEnvVar` names the environment variable the container
+reads the endpoint from — there is no `connection` block for this kind, because DSQL
+has no secret to decompose into fields; the endpoint is either a literal already
+known at plan time (adopted) or a deploy-time value published from SSM (created),
+exactly like a created ElastiCache cluster's endpoint.
+
+**One more thing worth flagging in the plan, not fixing in code:** the task role's IAM
+grant authorises the *connection attempt*, but DSQL still needs a database role
+linked to that IAM principal from inside the cluster — `CREATE ROLE <dbUser> WITH
+LOGIN; AWS IAM GRANT <dbUser> TO '<task-role-arn>';`. This is manual work the user
+does after the platform stack deploys, because the task role's ARN does not exist
+until then. See
+[resource-catalog.md](../planning/resource-catalog.md#dsql-cluster) for the full
+statement and the idempotency note.
+
 ## Recording
 
 Every datastore records a **`planId`** naming its entry in `plan.resources`, and a
 **`nameFound`** flag. Both exist for planning rather than for analysis:
 
 - `planId` is the link to the create-or-adopt decision. The network-reached kinds map
-  onto fixed ids (`database`, `cache`), but an API-reached entry's id names its role —
-  `receipts-bucket`, `sessions-table` — and two buckets are indistinguishable without
-  it. An adopted entry could once be matched by its identifiers; a created one has none.
+  onto fixed ids (`database`, `cache`), and DSQL onto `dsql-cluster` for the same
+  reason, but an API-reached entry's id names its role — `receipts-bucket`,
+  `sessions-table` — and two buckets are indistinguishable without it. An adopted
+  entry could once be matched by its identifiers; a created one has none.
 - `nameFound` says whether a name exists to look up in the account. `true` means
   planning runs one targeted lookup; `false` means there is nothing to look up, so
   planning asks instead of enumerating the account. **These are different branches**,
@@ -275,9 +338,31 @@ An API-reached datastore that could be created:
         attribute: tableName
 ```
 
+An IAM-authenticated datastore:
+
+```yaml
+  - kind: dsql
+    planId: dsql-cluster
+    nameFound: true
+    confidence: high
+    evidence:
+      - file: app/db.py
+        line: 4
+        excerpt: "new DsqlSigner({ hostname: process.env.DSQL_CLUSTER_ENDPOINT, region: 'us-east-1' })"
+      - file: app/db.py
+        line: 9
+        excerpt: 'const client = new pg.Client({ host: process.env.DSQL_CLUSTER_ENDPOINT, ... })'
+    iamActions:
+      - dsql:DbConnect
+    dbUser: app_user
+    endpointEnvVar: DSQL_CLUSTER_ENDPOINT
+```
+
 The `schema`, `connection` and `attributeVariables` fields carry evidence and a
 confidence level like every other finding, and record **names and fields only**. There is
-no property anywhere in them that could hold a credential value.
+no property anywhere in them that could hold a credential value. `dbUser` and
+`endpointEnvVar` carry the same guarantee for `dsql` — a role name and a variable
+name, never a value.
 
 ## Presenting
 

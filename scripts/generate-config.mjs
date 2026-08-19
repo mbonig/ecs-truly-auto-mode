@@ -23,9 +23,13 @@ const DEFAULT_ACTIONS = {
 
 const NETWORK_KINDS = new Set(['rds', 'elasticache', 'documentdb']);
 const API_KINDS = new Set(['dynamodb', 's3', 'sqs', 'sns']);
+const IAM_AUTH_KINDS = new Set(['dsql']);
 
 const DEFAULT_PORTS = { rds: 5432, elasticache: 6379, documentdb: 27017 };
 const ENGINE_PORTS = { postgres: 5432, mysql: 3306, mariadb: 3306, sqlserver: 1433, oracle: 1521 };
+
+/** dsql:DbConnect for a named database role, dsql:DbConnectAdmin for admin. */
+const DSQL_ACTIONS = { admin: ['dsql:DbConnectAdmin'], default: ['dsql:DbConnect'] };
 
 /** The identifier an adopted API-reached datastore has to name, for the error message. */
 const ADOPT_IDENTIFIER = {
@@ -162,6 +166,7 @@ function buildPublicHostname(manifest) {
 function buildDatastores(manifest) {
   const networkDatastores = [];
   const apiDatastores = [];
+  const iamAuthDatastores = [];
   const environmentFromSsm = {};
 
   for (const store of manifest.analysis?.datastores ?? []) {
@@ -193,6 +198,11 @@ function buildDatastores(manifest) {
       continue;
     }
 
+    if (IAM_AUTH_KINDS.has(store.kind)) {
+      iamAuthDatastores.push(buildIamAuthDatastore(manifest, store, entry, environmentFromSsm));
+      continue;
+    }
+
     if (!API_KINDS.has(store.kind)) {
       fail(`analysis.datastores: kind '${store.kind}' is neither network-reached nor API-reached`);
     }
@@ -200,7 +210,7 @@ function buildDatastores(manifest) {
     apiDatastores.push(buildApiDatastore(manifest, store, entry, environmentFromSsm));
   }
 
-  return { networkDatastores, apiDatastores, environmentFromSsm };
+  return { networkDatastores, apiDatastores, iamAuthDatastores, environmentFromSsm };
 }
 
 /** The plan entry a datastore is linked to. */
@@ -363,6 +373,78 @@ function buildDatabaseCredentials(manifest, store, entry) {
   return { secretArnParameter: `${entry.id}-secret-arn`, fields };
 }
 
+/**
+ * An IAM-authenticated network datastore: reached over TCP like RDS/ElastiCache, but
+ * authorised by IAM like DynamoDB/S3/SQS/SNS. Aurora DSQL — the only kind implemented
+ * so far — has no security group, no generated secret, and no password anywhere in
+ * the system, so it belongs to neither `NETWORK_KINDS` nor `API_KINDS`.
+ *
+ * The endpoint is never a secret — it is plaintext configuration, like a bucket name.
+ * On the adopt path its value is already known at plan time, so it is the analysis's
+ * job to have recorded it as a literal in `analysis.config.environment`; this function
+ * only checks that literal exists. On the create path it is a deploy-time value, like
+ * a created cache's endpoint, so it goes through `environmentFromSsm` instead.
+ */
+function buildIamAuthDatastore(manifest, store, entry, environmentFromSsm) {
+  if (!store.endpointEnvVar) {
+    fail(
+      `analysis.datastores: the dsql entry '${entry.id}' records no endpointEnvVar — the environment ` +
+        'variable the container reads the endpoint from must be named, learned from the code that ' +
+        'reads it, never invented.',
+    );
+  }
+
+  const dbUser = store.dbUser ?? 'admin';
+  const actions = store.iamActions?.length
+    ? store.iamActions
+    : dbUser === 'admin'
+      ? DSQL_ACTIONS.admin
+      : DSQL_ACTIONS.default;
+  const common = { id: entry.id, kind: store.kind, port: 5432, actions, dbUser };
+  const classification = manifest.analysis.egress.classification.value;
+
+  if (entry.action === 'adopt') {
+    const ids = entry.identifiers ?? {};
+    if (!ids.clusterIdentifier) {
+      fail(
+        `plan.resources: entry '${entry.id}' is marked adopt for a dsql datastore but records no ` +
+          'clusterIdentifier.',
+      );
+    }
+    if (classification === 'none' && !ids.vpcEndpointServiceName) {
+      fail(
+        `plan.resources: entry '${entry.id}' is adopted and egress.classification is 'none', but ` +
+          'records no vpcEndpointServiceName. The certificate DSQL presents on the public endpoint ' +
+          'does not cover the VPC-endpoint hostname, so the isolated form has to be resolved and ' +
+          'recorded — see references/analysis/egress.md.',
+      );
+    }
+    const environment = manifest.analysis?.config?.environment ?? [];
+    if (!environment.some((e) => e.name === store.endpointEnvVar)) {
+      fail(
+        `analysis.config.environment: '${store.endpointEnvVar}' is the dsql entry '${entry.id}'s ` +
+          "endpoint variable, but it is not recorded there. An adopted cluster's endpoint is known " +
+          'at plan time, so it belongs in the literal environment, not derived here.',
+      );
+    }
+
+    return {
+      ...common,
+      mode: 'adopt',
+      clusterIdentifier: ids.clusterIdentifier,
+      ...(ids.vpcEndpointServiceName ? { vpcEndpointServiceName: ids.vpcEndpointServiceName } : {}),
+    };
+  }
+
+  // Created: the endpoint does not exist until deploy, so it travels through SSM —
+  // same mechanism as a created ElastiCache cluster's endpoint, which has no secret
+  // to read a host out of either.
+  const endpointParameter = `${entry.id}-endpoint`;
+  environmentFromSsm[store.endpointEnvVar] = endpointParameter;
+
+  return { ...common, mode: 'create', endpointParameter };
+}
+
 function buildApiDatastore(manifest, store, entry, environmentFromSsm) {
   const actions = store.iamActions?.length ? store.iamActions : DEFAULT_ACTIONS[store.kind];
 
@@ -474,7 +556,7 @@ function buildPipeline(manifest) {
 function buildConfig(manifest) {
   const { analysis, app, target } = manifest;
   const health = analysis.container.healthCheck;
-  const { networkDatastores, apiDatastores, environmentFromSsm } = buildDatastores(manifest);
+  const { networkDatastores, apiDatastores, iamAuthDatastores, environmentFromSsm } = buildDatastores(manifest);
 
   const awsServices = new Set(analysis.egress.awsServices ?? []);
   // ECR image layers live in S3, so the gateway endpoint is required even for an app
@@ -496,6 +578,14 @@ function buildConfig(manifest) {
   // The service stack reads created datastore attributes from Parameter Store, but that
   // read is CloudFormation's at deploy time rather than the task's, so it adds no
   // endpoint requirement of its own.
+
+  // The DSQL *data* plane, not the control plane: connecting never calls the latter,
+  // since generating a connection auth token is local SigV4 signing with no request.
+  // Recording 'dsql' here would provision an endpoint that bills hourly and is never
+  // used to reach the datastore.
+  if (iamAuthDatastores.length > 0 && analysis.egress.classification.value === 'none') {
+    awsServices.add('dsql-data');
+  }
 
   const lbEntry = resource(manifest, 'load-balancer');
 
@@ -537,6 +627,7 @@ function buildConfig(manifest) {
 
     networkDatastores,
     apiDatastores,
+    iamAuthDatastores,
 
     environment: Object.fromEntries(
       (analysis.config?.environment ?? []).map((e) => [e.name, e.value]),

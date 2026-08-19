@@ -342,6 +342,48 @@ const corruptions = [
     },
     expect: 'records no planId',
   },
+  {
+    name: 'adopted dsql cluster records a security group',
+    base: 'dsql-adopted',
+    break: (m) => {
+      m.plan.resources.find((r) => r.id === 'dsql-cluster').identifiers.securityGroupId = 'sg-0abc123';
+    },
+    expect: 'has no security group to adopt',
+  },
+  {
+    name: 'isolated adopted dsql cluster missing the data-plane service name',
+    base: 'dsql-adopted',
+    break: (m) => {
+      delete m.plan.resources.find((r) => r.id === 'dsql-cluster').identifiers.vpcEndpointServiceName;
+    },
+    expect: 'vpcEndpointServiceName',
+  },
+  {
+    name: 'adopted dsql endpoint variable not recorded as a literal',
+    base: 'dsql-adopted',
+    break: (m) => {
+      m.analysis.config.environment = m.analysis.config.environment.filter(
+        (e) => e.name !== 'DSQL_CLUSTER_ENDPOINT',
+      );
+    },
+    expect: 'known at plan time',
+  },
+  {
+    name: 'isolated dsql datastore missing the data-plane endpoint',
+    base: 'dsql-created',
+    break: (m) => {
+      m.analysis.egress.awsServices = m.analysis.egress.awsServices.filter((s) => s !== 'dsql-data');
+    },
+    expect: 'omits "dsql-data"',
+  },
+  {
+    name: 'dsql datastore with no endpoint variable named',
+    base: 'dsql-created',
+    break: (m) => {
+      delete m.analysis.datastores.find((d) => d.kind === 'dsql').endpointEnvVar;
+    },
+    expect: 'records no endpointEnvVar',
+  },
 ];
 
 function main() {

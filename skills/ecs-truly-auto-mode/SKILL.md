@@ -213,6 +213,15 @@ call genuinely cannot be classified, classify it `public` and say why — but do
 classify `public` on the mere possibility of an external call. "I found no external
 calls" and "I couldn't tell" are different answers.
 
+An AWS service having no *obvious* VPC endpoint is not evidence that it has none —
+check `aws ec2 describe-vpc-endpoint-services`, and check it as a first-class
+infrastructure claim, the same way a code finding needs a `file:line`. A wire-protocol
+service like Aurora DSQL looks exactly like something an SDK-only endpoint table would
+miss, and a prose claim that "there is no interface endpoint for it" is exactly the
+kind of thing that reads as authoritative and turns out to be checkable and wrong.
+Trusting it produces a NAT gateway that pays, indefinitely, to reach a service that was
+privately reachable all along.
+
 ---
 
 ## Completion
@@ -231,7 +240,12 @@ Report:
 3. **The service stack is deployed by the pipeline**, on push to the configured
    branch. It is not deployed by hand and not deployed by the platform stack.
 4. **What the user must do** — create secrets that don't exist yet, complete a
-   CodeConnections handshake, point DNS.
+   CodeConnections handshake, point DNS, and, for a DSQL cluster, run the SQL that
+   links the task role's IAM grant to a database role inside the cluster (see
+   [resource-catalog.md](./references/planning/resource-catalog.md#dsql-cluster)).
+   The IAM policy alone does not let the task connect — DSQL still needs a role
+   inside the database, and an `AWS IAM GRANT` binding that role to the task role's
+   ARN.
 5. **Created datastores, and what they imply.** Two things the user will not otherwise
    find out until it costs them:
    - A created database comes up **empty**. Schema migrations are not generated and the
