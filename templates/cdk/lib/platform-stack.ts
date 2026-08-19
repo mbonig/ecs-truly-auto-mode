@@ -23,7 +23,15 @@ import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as targets from 'aws-cdk-lib/aws-route53-targets';
-import { AppConfig, AwsServiceKey } from './config';
+import * as rds from 'aws-cdk-lib/aws-rds';
+import * as docdb from 'aws-cdk-lib/aws-docdb';
+import * as elasticache from 'aws-cdk-lib/aws-elasticache';
+import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as s3 from 'aws-cdk-lib/aws-s3';
+import * as sqs from 'aws-cdk-lib/aws-sqs';
+import * as sns from 'aws-cdk-lib/aws-sns';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import { AppConfig, AwsServiceKey, CreatedApiDatastore, TableAttribute } from './config';
 import { GitHubOidcRole } from './deploy-permissions';
 
 export interface PlatformStackGitHubActions {
@@ -63,6 +71,17 @@ export class PlatformStack extends cdk.Stack {
   private readonly githubActions?: PlatformStackGitHubActions;
 
   /**
+   * Parameter suffix → value, for every created datastore attribute the service stack
+   * or an operator needs. Filled while the datastores are built and written out by
+   * `publishParameters`, because a created resource's endpoint, table name or secret
+   * ARN is a deploy-time value that cannot be known when the service stack synthesizes.
+   *
+   * The suffixes come from the config rather than being derived here — see
+   * `CreatedNetworkDatastore.endpointParameter`.
+   */
+  private readonly datastoreParameters = new Map<string, string>();
+
+  /**
    * Serving AZs from config rather than the default implementation is what keeps
    * synth offline. The base implementation performs a context lookup against the
    * target account, which fails outright without credentials — and a pipeline that
@@ -94,10 +113,16 @@ export class PlatformStack extends cdk.Stack {
     const logGroup = this.buildLogGroup();
     const taskSecurityGroup = this.buildTaskSecurityGroup(this.vpc);
 
-    this.wireNetworkDatastores(taskSecurityGroup);
-
+    // The execution role is built before the datastores because a *created* database
+    // owns its own generated secret, and the stack that owns both is the one that
+    // grants read on it — no ARN travels through the config and no wildcard is needed.
     const executionRole = this.buildExecutionRole();
-    const taskRole = this.buildTaskRole();
+
+    this.wireNetworkDatastores(taskSecurityGroup, executionRole);
+
+    // Created API-reached resources have no ARN until they exist, so they are built
+    // first and the task role is granted against what came back.
+    const taskRole = this.buildTaskRole(this.buildApiDatastores());
 
     const targetGroup = config.loadBalancer
       ? this.buildLoadBalancing(this.vpc, taskSecurityGroup)
@@ -277,26 +302,229 @@ export class PlatformStack extends cdk.Stack {
   }
 
   /**
-   * Network-reached datastores need an ingress rule on *their* security group,
-   * allowing the task group in. This is the piece most often missed, and it fails
-   * as a connection timeout at startup rather than a clear permission error.
+   * Network-reached datastores need an ingress rule allowing the task group in on the
+   * engine port. This is the piece most often missed, and it fails as a connection
+   * timeout at startup rather than a clear permission error.
+   *
+   * The two modes differ in whose security group that rule lands on. An adopted
+   * datastore's group belongs to someone else and is imported to have one rule added;
+   * a created datastore's group is defined here, so there is nothing to import and
+   * nothing of anyone else's to mutate.
    */
-  private wireNetworkDatastores(taskSg: ec2.ISecurityGroup): void {
+  private wireNetworkDatastores(taskSg: ec2.ISecurityGroup, executionRole: iam.IRole): void {
     for (const store of this.config.networkDatastores) {
-      const storeSg = ec2.SecurityGroup.fromSecurityGroupId(
-        this,
-        `DatastoreSg${pascal(store.id)}`,
-        store.securityGroupId,
-        // The datastore's security group is not ours to own or mutate wholesale.
-        { mutable: true },
-      );
+      if (store.mode === 'adopt') {
+        const storeSg = ec2.SecurityGroup.fromSecurityGroupId(
+          this,
+          `DatastoreSg${pascal(store.id)}`,
+          store.securityGroupId,
+          // The datastore's security group is not ours to own or mutate wholesale.
+          { mutable: true },
+        );
+        storeSg.addIngressRule(
+          taskSg,
+          ec2.Port.tcp(store.port),
+          // Restricted charset — see the note on the load balancer rule below.
+          `${this.config.name} tasks to ${store.id}`,
+        );
+        continue;
+      }
+
+      const storeSg = new ec2.SecurityGroup(this, `DatastoreSg${pascal(store.id)}`, {
+        vpc: this.vpc,
+        description: `${store.kind} ${store.id} for ${this.config.name}`,
+        allowAllOutbound: false,
+      });
       storeSg.addIngressRule(
         taskSg,
         ec2.Port.tcp(store.port),
-        // Restricted charset — see the note on the load balancer rule below.
         `${this.config.name} tasks to ${store.id}`,
       );
+
+      switch (store.kind) {
+        case 'rds':
+          this.buildDatabaseInstance(store, storeSg, executionRole);
+          break;
+        case 'documentdb':
+          this.buildDocumentDbCluster(store, storeSg, executionRole);
+          break;
+        case 'elasticache':
+          this.buildElastiCache(store, storeSg);
+          break;
+      }
     }
+  }
+
+  /** Records a created datastore attribute for `publishParameters` to write out. */
+  private recordParameter(suffix: string, value: string): void {
+    if (this.datastoreParameters.has(suffix)) {
+      throw new Error(
+        `two datastores publish the SSM parameter suffix "${suffix}" — one would overwrite the other, and the container would read whichever deployed last`,
+      );
+    }
+    this.datastoreParameters.set(suffix, value);
+  }
+
+  /**
+   * A created relational database.
+   *
+   * Retained and deletion-protected on purpose: a retained instance costs money and
+   * can be deleted by hand in a minute, while a destroyed one is gone. That asymmetry
+   * is total, so the default sits on the safe side of it and the plan says so.
+   *
+   * The first deploy of this stack blocks for tens of minutes while the instance is
+   * provisioned. That is stated in the plan too — it is not a hang.
+   */
+  private buildDatabaseInstance(
+    store: Extract<AppConfig['networkDatastores'][number], { mode: 'create'; kind: 'rds' }>,
+    securityGroup: ec2.ISecurityGroup,
+    executionRole: iam.IRole,
+  ): void {
+    const id = pascal(store.id);
+
+    // The username carries no cost and no durability consequence, so it is fixed
+    // rather than asked. It does not need to be memorable: the application reads it
+    // out of the generated secret's `username` field.
+    const secret = new secretsmanager.Secret(this, `DatastoreSecret${id}`, {
+      // Deterministic, so the secret is findable by name in the console without
+      // going via the stack's resource list.
+      secretName: `${this.config.name}/${store.id}`,
+      description: `Generated credentials for ${store.id}`,
+      generateSecretString: {
+        secretStringTemplate: JSON.stringify({ username: 'appuser' }),
+        generateStringKey: 'password',
+        // The RDS-forbidden characters, plus the ones that break URL parsing for
+        // applications that assemble a connection string from these fields.
+        excludeCharacters: ' %+~`#$&*()|[]{}:;<>?!\'/@"\\,=',
+      },
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    const instance = new rds.DatabaseInstance(this, `Datastore${id}`, {
+      engine: databaseEngine(store.engine, store.engineVersion),
+      // RDS instance classes are written `db.t4g.micro`; the CDK adds the `db.` prefix
+      // itself, so passing it through would produce `db.db.t4g.micro`.
+      instanceType: new ec2.InstanceType(store.instanceClass.replace(/^db\./, '')),
+      vpc: this.vpc,
+      vpcSubnets: this.appSubnets,
+      securityGroups: [securityGroup],
+      credentials: rds.Credentials.fromSecret(secret),
+      allocatedStorage: store.allocatedStorageGb,
+      multiAz: store.multiAz,
+      port: store.port,
+      // SQL Server and Oracle reject `databaseName` on an instance — a database is
+      // created inside them afterwards instead. Postgres and MySQL take one, and the
+      // application needs it, so it is set where it is accepted.
+      databaseName: acceptsDatabaseName(store.engine) ? databaseName(this.config.name) : undefined,
+      storageEncrypted: true,
+      deletionProtection: true,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    // This stack owns the secret and the execution role, so the grant is written here
+    // rather than derived from an ARN in the config. Scoped to this one secret.
+    secret.grantRead(executionRole);
+
+    this.recordParameter(store.endpointParameter, instance.dbInstanceEndpointAddress);
+    this.recordParameter(store.portParameter, instance.dbInstanceEndpointPort);
+    this.recordParameter(store.credentials.secretArnParameter, secret.secretArn);
+  }
+
+  /** A created DocumentDB cluster. Retained and deletion-protected, as RDS is. */
+  private buildDocumentDbCluster(
+    store: Extract<AppConfig['networkDatastores'][number], { mode: 'create'; kind: 'documentdb' }>,
+    securityGroup: ec2.ISecurityGroup,
+    executionRole: iam.IRole,
+  ): void {
+    const id = pascal(store.id);
+
+    const cluster = new docdb.DatabaseCluster(this, `Datastore${id}`, {
+      masterUser: {
+        username: 'appuser',
+        secretName: `${this.config.name}/${store.id}`,
+        excludeCharacters: ' %+~`#$&*()|[]{}:;<>?!\'/@"\\,=',
+      },
+      instanceType: new ec2.InstanceType(store.instanceClass.replace(/^db\./, '')),
+      instances: store.instanceCount,
+      vpc: this.vpc,
+      vpcSubnets: this.appSubnets,
+      securityGroup,
+      port: store.port,
+      storageEncrypted: true,
+      deletionProtection: true,
+      removalPolicy: cdk.RemovalPolicy.RETAIN,
+    });
+
+    // `secret` is optional on the type because a cluster can be given a password
+    // directly. This one always generates, so an absent secret is a bug, not a case.
+    if (!cluster.secret) {
+      throw new Error(`DocumentDB cluster ${store.id} generated no secret to grant`);
+    }
+    cluster.secret.grantRead(executionRole);
+
+    this.recordParameter(store.endpointParameter, cluster.clusterEndpoint.hostname);
+    this.recordParameter(store.portParameter, cdk.Token.asString(cluster.clusterEndpoint.port));
+    this.recordParameter(store.credentials.secretArnParameter, cluster.secret.secretArn);
+  }
+
+  /**
+   * A created ElastiCache cluster.
+   *
+   * This is the one datastore built from L1 constructs: aws-cdk-lib ships no L2 for
+   * ElastiCache. So there are no `grant*` methods here, the property names follow
+   * CloudFormation rather than the CDK, and the retention policy is applied to the
+   * resource directly instead of passed as a prop.
+   *
+   * At-rest encryption is on — it is transparent to the client. In-transit encryption
+   * is deliberately *not*: it requires the application to connect over TLS, so turning
+   * it on silently would break a client that connects in plaintext.
+   */
+  private buildElastiCache(
+    store: Extract<AppConfig['networkDatastores'][number], { mode: 'create'; kind: 'elasticache' }>,
+    securityGroup: ec2.ISecurityGroup,
+  ): void {
+    const id = pascal(store.id);
+
+    const subnetGroup = new elasticache.CfnSubnetGroup(this, `DatastoreSubnets${id}`, {
+      description: `${store.id} for ${this.config.name}`,
+      subnetIds: this.vpc.selectSubnets(this.appSubnets).subnetIds,
+    });
+
+    if (store.engine === 'redis') {
+      const group = new elasticache.CfnReplicationGroup(this, `Datastore${id}`, {
+        replicationGroupDescription: `${store.id} for ${this.config.name}`,
+        engine: 'redis',
+        cacheNodeType: store.nodeType,
+        // One primary plus the replicas asked for.
+        numCacheClusters: 1 + (store.replicaCount ?? 0),
+        automaticFailoverEnabled: (store.replicaCount ?? 0) > 0,
+        cacheSubnetGroupName: subnetGroup.ref,
+        securityGroupIds: [securityGroup.securityGroupId],
+        atRestEncryptionEnabled: true,
+        port: store.port,
+      });
+      group.addDependency(subnetGroup);
+      group.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
+
+      this.recordParameter(store.endpointParameter, group.attrPrimaryEndPointAddress);
+      this.recordParameter(store.portParameter, group.attrPrimaryEndPointPort);
+      return;
+    }
+
+    const cluster = new elasticache.CfnCacheCluster(this, `Datastore${id}`, {
+      engine: 'memcached',
+      cacheNodeType: store.nodeType,
+      // Memcached scales by node count rather than by replicas.
+      numCacheNodes: Math.max(1, store.replicaCount ?? 1),
+      cacheSubnetGroupName: subnetGroup.ref,
+      vpcSecurityGroupIds: [securityGroup.securityGroupId],
+      port: store.port,
+    });
+    cluster.addDependency(subnetGroup);
+    cluster.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
+
+    this.recordParameter(store.endpointParameter, cluster.attrConfigurationEndpointAddress);
+    this.recordParameter(store.portParameter, cluster.attrConfigurationEndpointPort);
   }
 
   private buildExecutionRole(): iam.IRole {
@@ -346,17 +574,120 @@ export class PlatformStack extends cdk.Stack {
   }
 
   /**
+   * Build every API-reached datastore the plan creates, and return the ARNs each grant
+   * has to be written against.
+   *
+   * Created and adopted converge here deliberately: the *policy* is the same statement
+   * in both cases, carrying exactly the actions the analysis recorded. Only the source
+   * of the ARN differs — an adopted store names it, a created one has none until the
+   * construct exists. Writing one statement shape for both keeps "never wildcards" a
+   * single rule rather than two that can drift apart.
+   */
+  private buildApiDatastores(): Array<{ id: string; actions: string[]; resourceArns: string[] }> {
+    return this.config.apiDatastores.map((store) => {
+      if (store.mode === 'adopt') {
+        return { id: store.id, actions: store.actions, resourceArns: store.resourceArns };
+      }
+      return {
+        id: store.id,
+        actions: store.actions,
+        resourceArns: this.buildCreatedApiDatastore(store),
+      };
+    });
+  }
+
+  /** One created API-reached resource. All are retained: the data outlives the service. */
+  private buildCreatedApiDatastore(store: CreatedApiDatastore & { id: string }): string[] {
+    const id = pascal(store.id);
+
+    switch (store.kind) {
+      case 'dynamodb': {
+        const table = new dynamodb.Table(this, `Datastore${id}`, {
+          partitionKey: tableAttribute(store.partitionKey),
+          sortKey: store.sortKey ? tableAttribute(store.sortKey) : undefined,
+          // On-demand, because no capacity figure is derivable from static analysis and
+          // a guessed provisioned capacity is either a throttle or a standing bill.
+          billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+          // Cheap, and the alternative to having it is silent, unrecoverable data loss.
+          pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+          removalPolicy: cdk.RemovalPolicy.RETAIN,
+        });
+
+        for (const index of store.indexes ?? []) {
+          table.addGlobalSecondaryIndex({
+            indexName: index.name,
+            partitionKey: tableAttribute(index.partitionKey),
+            sortKey: index.sortKey ? tableAttribute(index.sortKey) : undefined,
+          });
+        }
+
+        this.recordParameter(store.attributeParameter, table.tableName);
+        // The index wildcard covers the indexes *of this table* only — it is not a
+        // wildcard resource, and index access genuinely needs its own ARN alongside
+        // the table's, which is a routine source of confusing access-denied errors.
+        return store.indexes?.length
+          ? [table.tableArn, `${table.tableArn}/index/*`]
+          : [table.tableArn];
+      }
+
+      case 's3': {
+        const bucket = new s3.Bucket(this, `Datastore${id}`, {
+          encryption: s3.BucketEncryption.S3_MANAGED,
+          blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
+          enforceSSL: true,
+          versioned: true,
+          removalPolicy: cdk.RemovalPolicy.RETAIN,
+        });
+        this.recordParameter(store.attributeParameter, bucket.bucketName);
+        // Object actions and bucket actions take different resource ARNs. Granting only
+        // the first is why `s3:ListBucket` fails on a policy that looks complete.
+        return [bucket.bucketArn, `${bucket.bucketArn}/*`];
+      }
+
+      case 'sqs': {
+        // A queue with no dead-letter queue silently discards what it cannot process.
+        const dlq = new sqs.Queue(this, `Datastore${id}Dlq`, {
+          enforceSSL: true,
+          retentionPeriod: cdk.Duration.days(14),
+        });
+        dlq.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
+
+        const queue = new sqs.Queue(this, `Datastore${id}`, {
+          enforceSSL: true,
+          deadLetterQueue: { queue: dlq, maxReceiveCount: 5 },
+        });
+        queue.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
+
+        this.recordParameter(store.attributeParameter, queue.queueUrl);
+        return [queue.queueArn];
+      }
+
+      case 'sns': {
+        const topic = new sns.Topic(this, `Datastore${id}`, {
+          displayName: `${store.id} for ${this.config.name}`,
+        });
+        topic.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
+
+        this.recordParameter(store.attributeParameter, topic.topicArn);
+        return [topic.topicArn];
+      }
+    }
+  }
+
+  /**
    * The task role carries only what the application code was found to use, scoped to
    * the exact resources in the plan. Wildcards would make the analysis's uncertainty
    * permanent and invisible.
    */
-  private buildTaskRole(): iam.IRole {
+  private buildTaskRole(
+    datastores: Array<{ id: string; actions: string[]; resourceArns: string[] }>,
+  ): iam.IRole {
     const role = new iam.Role(this, 'TaskRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
       description: `Application permissions for ${this.config.name}`,
     });
 
-    for (const store of this.config.apiDatastores) {
+    for (const store of datastores) {
       role.addToPrincipalPolicy(
         new iam.PolicyStatement({
           sid: `${pascal(store.id)}Access`,
@@ -601,7 +932,79 @@ export class PlatformStack extends cdk.Stack {
     if (refs.targetGroup) {
       put('target-group-arn', refs.targetGroup.targetGroupArn);
     }
+
+    // Created datastore attributes: endpoints, ports, table and bucket names, queue
+    // URLs, topic ARNs, and the ARN of a created database's generated secret. Every
+    // one of these is a deploy-time value, which is exactly why they travel this way
+    // rather than as literals in the generated config.
+    //
+    // Nothing is published for an *adopted* datastore. Its identifiers were known at
+    // planning time and are already literals in the config, so publishing them would
+    // make this parameter set a dump of what is known rather than a contract for what
+    // is not.
+    for (const [suffix, value] of this.datastoreParameters) {
+      put(suffix, value);
+    }
   }
+}
+
+/** The RDS engine and version, as the CDK's per-engine factory wants them. */
+function databaseEngine(
+  engine: 'postgres' | 'mysql' | 'mariadb' | 'sqlserver' | 'oracle',
+  version: string,
+): rds.IInstanceEngine {
+  // The CDK wants the major version alongside the full one, and derives nothing from
+  // the string itself. For Postgres the major version is the first component; for the
+  // others it is the first two, which is why this is not one shared expression.
+  const parts = version.split('.');
+  switch (engine) {
+    case 'postgres':
+      return rds.DatabaseInstanceEngine.postgres({
+        version: rds.PostgresEngineVersion.of(version, parts[0]),
+      });
+    case 'mysql':
+      return rds.DatabaseInstanceEngine.mysql({
+        version: rds.MysqlEngineVersion.of(version, parts.slice(0, 2).join('.')),
+      });
+    case 'mariadb':
+      return rds.DatabaseInstanceEngine.mariaDb({
+        version: rds.MariaDbEngineVersion.of(version, parts.slice(0, 2).join('.')),
+      });
+    case 'sqlserver':
+      // Express edition: it is the one with no licence cost. A different edition is a
+      // licensing decision, which is not something to infer from application code.
+      return rds.DatabaseInstanceEngine.sqlServerEx({
+        version: rds.SqlServerEngineVersion.of(version, parts.slice(0, 2).join('.')),
+      });
+    case 'oracle':
+      return rds.DatabaseInstanceEngine.oracleSe2({
+        version: rds.OracleEngineVersion.of(version, parts[0]),
+      });
+  }
+}
+
+/**
+ * Whether the engine accepts a database name on the instance itself.
+ *
+ * SQL Server and Oracle do not — CloudFormation rejects the property, and a database
+ * is created inside the instance afterwards instead.
+ */
+function acceptsDatabaseName(engine: string): boolean {
+  return engine === 'postgres' || engine === 'mysql' || engine === 'mariadb';
+}
+
+/** A database name derived from the app name: identifiers, not hyphens. */
+function databaseName(appName: string): string {
+  return appName.replace(/[^a-zA-Z0-9]/g, '_');
+}
+
+function tableAttribute(attribute: TableAttribute): dynamodb.Attribute {
+  const types = {
+    string: dynamodb.AttributeType.STRING,
+    number: dynamodb.AttributeType.NUMBER,
+    binary: dynamodb.AttributeType.BINARY,
+  };
+  return { name: attribute.name, type: types[attribute.type] };
 }
 
 function pascal(value: string): string {

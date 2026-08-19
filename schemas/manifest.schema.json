@@ -120,12 +120,95 @@
             "required": ["kind", "evidence", "confidence"],
             "additionalProperties": false,
             "properties": {
-              "kind": { "enum": ["rds", "dynamodb", "elasticache", "s3", "other"] },
+              "kind": {
+                "description": "Every kind the analysis can name, plus 'other'. A kind absent from this list cannot be recorded at all, which drops the datastore from the plan silently — which is why 'documentdb', 'sqs' and 'sns' are here even though only the create path is new: config.ts and generate-config.mjs have always handled them.",
+                "enum": ["rds", "dynamodb", "elasticache", "documentdb", "s3", "sqs", "sns", "other"]
+              },
               "engine": { "type": "string" },
               "evidence": { "$ref": "#/definitions/evidenceList" },
               "confidence": { "$ref": "#/definitions/confidence" },
               "confirmedByUser": { "type": "boolean" },
-              "iamActions": { "type": "array", "items": { "type": "string" } }
+              "iamActions": { "type": "array", "items": { "type": "string" } },
+              "planId": {
+                "description": "The id of this datastore's entry in plan.resources. Explicit rather than derived: the network-reached kinds map onto fixed ids, but an API-reached entry's id names its role ('receipts-bucket', 'sessions-table'), and two buckets are indistinguishable without this. Before created datastores existed the projection could infer the link from an adopted entry's identifiers — a created entry has none, so the link has to be recorded.",
+                "type": "string",
+                "minLength": 1
+              },
+              "nameFound": {
+                "description": "Whether the analysis found an identifying name for this datastore — a table name literal, a bucket name, the first label of an *.rds.amazonaws.com host. Planning branches on it: a recorded name gets one targeted account lookup, and the absence of one means there is nothing to look up, so the entry is asked about instead of enumerated. Absent means the same as false.",
+                "type": "boolean"
+              },
+              "schema": {
+                "description": "The key shape of a DynamoDB table, recorded so the table can be created. A table's key schema is immutable — a wrong partition key means deleting and rebuilding a table that may by then hold data — so a create decision requires 'partitionKey' at high confidence or confirmedByUser. See the createdTableHasConfirmedKeySchema consistency check.",
+                "type": "object",
+                "required": ["partitionKey"],
+                "additionalProperties": false,
+                "properties": {
+                  "partitionKey": { "$ref": "#/definitions/keyAttributeFinding" },
+                  "sortKey": { "$ref": "#/definitions/keyAttributeFinding" },
+                  "indexes": {
+                    "description": "Only the indexes the code was found to query. An index nobody queries is a standing write cost.",
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "required": ["name", "partitionKey"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "name": { "type": "string", "minLength": 1 },
+                        "partitionKey": { "$ref": "#/definitions/keyAttribute" },
+                        "sortKey": { "$ref": "#/definitions/keyAttribute" }
+                      }
+                    }
+                  }
+                }
+              },
+              "connection": {
+                "description": "How the application reaches a network-reached datastore. The style decides whether a created datastore is usable at all: a generated secret supplies discrete fields, and cannot supply an assembled URL without something reading the password to compose one. Names variables and secret fields only — there is deliberately no property here that could hold a credential value.",
+                "type": "object",
+                "required": ["style", "variables"],
+                "additionalProperties": false,
+                "properties": {
+                  "style": {
+                    "allOf": [
+                      { "$ref": "#/definitions/finding" },
+                      { "properties": { "value": { "enum": ["fields", "url"] } } }
+                    ]
+                  },
+                  "variables": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "object",
+                      "required": ["name"],
+                      "additionalProperties": false,
+                      "properties": {
+                        "name": {
+                          "description": "The environment variable name the container reads.",
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "field": {
+                          "description": "The field of the datastore's credentials secret that supplies this variable. Set for style 'fields'; meaningless for style 'url', where no single field is the URL.",
+                          "enum": ["host", "port", "username", "password", "dbname"]
+                        }
+                      }
+                    }
+                  }
+                }
+              },
+              "attributeVariables": {
+                "description": "Environment variables carrying the name of an API-reached resource. For a created resource that name is a deploy-time value, so the platform stack publishes it to SSM and the service stack injects it here — without this mapping a created table exists and the container has no way to address it.",
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["name", "attribute"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "name": { "type": "string", "minLength": 1 },
+                    "attribute": { "enum": ["tableName", "bucketName", "queueUrl", "topicArn"] }
+                  }
+                }
+              }
             }
           }
         },
@@ -171,6 +254,11 @@
               "id": { "type": "string", "minLength": 1 },
               "action": { "enum": ["create", "adopt", "skip"] },
               "identifiers": { "type": "object", "minProperties": 1 },
+              "parameters": {
+                "description": "The chosen shape of a resource the system creates — an instance class, a node type, a table's key schema. The mirror of `identifiers`: that field says what to import, this one says what to build. They are separate rather than one bag because a created resource has nothing to import and an adopted one has no shape to choose, so a value in the wrong one would silently apply to nothing. As with `identifiers`, the converse rule — that an adopted resource carries no parameters — lives in the consistency checks, where the message can say why.",
+                "type": "object",
+                "minProperties": 1
+              },
               "reason": { "type": "string", "minLength": 1 },
               "validated": { "type": "boolean" }
             },
@@ -246,6 +334,25 @@
 
   "definitions": {
     "confidence": { "enum": ["high", "medium", "low", "conflict"] },
+
+    "keyAttribute": {
+      "description": "One attribute of a DynamoDB key. The type is the DynamoDB attribute type, not a language type — getting it wrong is as unfixable as getting the name wrong, because both are part of the immutable key schema.",
+      "type": "object",
+      "required": ["name", "type"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "type": { "enum": ["string", "number", "binary"] }
+      }
+    },
+
+    "keyAttributeFinding": {
+      "description": "A key attribute recorded as a finding, so it carries the file and line that support it and a confidence level. Static analysis identifies a table's key attribute names far less reliably than it identifies that a table is used at all, and this is the field that makes that gap visible instead of defaulted.",
+      "allOf": [
+        { "$ref": "#/definitions/finding" },
+        { "properties": { "value": { "$ref": "#/definitions/keyAttribute" } } }
+      ]
+    },
 
     "evidenceList": {
       "type": "array",

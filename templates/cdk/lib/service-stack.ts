@@ -98,8 +98,8 @@ export class ServiceStack extends cdk.Stack {
 
     const container = taskDefinition.addContainer('app', {
       image: ecs.ContainerImage.fromEcrRepository(repository, imageTag.valueAsString),
-      environment: config.environment,
-      secrets: this.buildSecrets(config),
+      environment: this.buildEnvironment(config, read),
+      secrets: this.buildSecrets(config, read),
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: config.name,
         logGroup: logs.LogGroup.fromLogGroupName(this, 'LogGroup', logGroupName),
@@ -169,13 +169,88 @@ export class ServiceStack extends cdk.Stack {
   }
 
   /**
+   * Environment variables, from two sources that cannot be one.
+   *
+   * `environment` holds literals — values known when the plan was approved, which is
+   * every adopted resource's name. `environmentFromSsm` holds the ones that were not:
+   * a *created* table's name, a created cache's endpoint. Those are deploy-time values,
+   * so they arrive as parameters the platform stack published.
+   *
+   * A name appearing in both is an error rather than a precedence question. Silently
+   * preferring one would leave the container reading a value the plan does not show,
+   * which is the kind of thing that is only ever diagnosed by reading a task definition
+   * in the console.
+   */
+  private buildEnvironment(
+    config: AppConfig,
+    read: (name: string) => string,
+  ): Record<string, string> {
+    const environment: Record<string, string> = { ...config.environment };
+
+    for (const [name, parameter] of Object.entries(config.environmentFromSsm)) {
+      if (name in environment) {
+        throw new Error(
+          `environment variable ${name} is set both as a literal and from the SSM parameter ${parameter} — one would silently win`,
+        );
+      }
+      environment[name] = read(parameter);
+    }
+
+    const clash = Object.keys(environment).filter((name) => secretNames(config).has(name));
+    if (clash.length > 0) {
+      throw new Error(
+        `environment variable(s) ${clash.join(', ')} are set as both an environment value and a secret — ECS rejects a task definition that does both`,
+      );
+    }
+
+    return environment;
+  }
+
+  /**
    * Secrets are injected by reference. No value passes through this template — the
    * ECS agent fetches them at task start using the execution role.
+   *
+   * Two sources, and the difference is who owns the secret. `config.secrets` are
+   * secrets that already existed and were named in the plan. A *created* database's
+   * credentials are generated, so nothing could name them at planning time: the
+   * platform stack makes the secret, grants the execution role read on it, and
+   * publishes its ARN, and each mapped field is injected from there.
    */
-  private buildSecrets(config: AppConfig): Record<string, ecs.Secret> {
+  private buildSecrets(
+    config: AppConfig,
+    read: (name: string) => string,
+  ): Record<string, ecs.Secret> {
     const secrets: Record<string, ecs.Secret> = {};
 
+    for (const store of config.networkDatastores) {
+      if (store.mode !== 'create') continue;
+      if (store.kind !== 'rds' && store.kind !== 'documentdb') continue;
+
+      // `fromSecretCompleteArn` takes an unresolved token: it stores the ARN without
+      // parsing it, and `ecs.Secret.fromSecretsManager` appends `:<field>::` to build
+      // the `valueFrom`. That is what makes reading the ARN from SSM viable, and why
+      // the alternative — a partial ARN from `fromSecretNameV2`, which would need a
+      // wildcard on the execution role's grant — is not used.
+      const secret = secretsmanager.Secret.fromSecretCompleteArn(
+        this,
+        `DatastoreSecret${store.id}`,
+        read(store.credentials.secretArnParameter),
+      );
+
+      for (const [name, field] of Object.entries(store.credentials.fields)) {
+        if (name in secrets) {
+          throw new Error(`environment variable ${name} is injected by more than one datastore secret`);
+        }
+        secrets[name] = ecs.Secret.fromSecretsManager(secret, field);
+      }
+    }
+
     for (const ref of config.secrets) {
+      if (ref.name in secrets) {
+        throw new Error(
+          `secret ${ref.name} is recorded in the plan and also supplied by a created datastore's generated credentials — the plan should record one source, not both`,
+        );
+      }
       if (ref.source === 'secretsmanager') {
         const secret = secretsmanager.Secret.fromSecretCompleteArn(
           this,
@@ -197,4 +272,15 @@ export class ServiceStack extends cdk.Stack {
 
     return secrets;
   }
+}
+
+/** Every environment variable name that arrives as a secret rather than a value. */
+function secretNames(config: AppConfig): Set<string> {
+  const names = new Set(config.secrets.map((ref) => ref.name));
+  for (const store of config.networkDatastores) {
+    if (store.mode !== 'create') continue;
+    if (store.kind !== 'rds' && store.kind !== 'documentdb') continue;
+    for (const name of Object.keys(store.credentials.fields)) names.add(name);
+  }
+  return names;
 }

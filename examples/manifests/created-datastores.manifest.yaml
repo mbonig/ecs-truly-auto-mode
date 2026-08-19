@@ -1,0 +1,245 @@
+# Example manifest: an isolated API whose datastores are all *created* rather than
+# adopted. This is the fixture for the create half of the create-or-adopt decision.
+#
+# Four things it pins down:
+#   1. A created RDS instance whose application reads discrete connection fields, so
+#      the generated secret can serve it. Host and port come from published
+#      parameters; username and password come from the secret's fields.
+#   2. A created DynamoDB table with a high-confidence key schema — the only shape a
+#      table may be created on, because the key schema is immutable.
+#   3. `secretsmanager` in awsServices even though the application records no secret of
+#      its own. The created database generates one, and on Fargate the ECS agent
+#      fetches it through the task's own ENI — an isolated task without that endpoint
+#      cannot start, and the error names Secrets Manager rather than the database.
+#   4. Created datastores carry `parameters`, never `identifiers`. There is nothing to
+#      import; there is a shape to build.
+schemaVersion: 1
+
+app:
+  name: ledger-api
+  dockerfile: Dockerfile
+  buildContext: .
+
+target:
+  account: '071128183726'
+  region: us-east-1
+  ssmPrefix: /ecs-auto-mode/ledger-api
+
+analysis:
+  buildValidated: true
+
+  architecture:
+    value: ARM64
+    confidence: high
+    evidence:
+      - file: Dockerfile
+        line: 1
+        excerpt: 'FROM --platform=linux/arm64 node:22-alpine'
+
+  container:
+    port:
+      value: 8080
+      confidence: high
+      evidence:
+        - file: Dockerfile
+          line: 12
+          excerpt: 'EXPOSE 8080'
+    healthCheck:
+      type:
+        value: http
+        confidence: high
+        evidence:
+          - file: src/server.ts
+            line: 9
+            excerpt: "app.get('/health', (_req, res) => res.sendStatus(200))"
+      path:
+        value: /health
+        confidence: high
+        evidence:
+          - file: src/server.ts
+            line: 9
+            excerpt: "app.get('/health', ...)"
+
+  egress:
+    classification:
+      value: none
+      confidence: high
+      evidence:
+        - file: src/server.ts
+          excerpt: 'only route handlers, pg and the DynamoDB SDK; no outbound HTTP client'
+        - file: package.json
+          line: 14
+          excerpt: 'dependencies contain no HTTP client or third-party SDK'
+    awsServices:
+      - dynamodb
+      - ecr
+      - ecr-docker
+      - logs
+      - secretsmanager
+    externalHosts: []
+
+  hostnames:
+    public: []
+    internal: []
+
+  datastores:
+    - kind: rds
+      engine: postgres
+      planId: database
+      nameFound: false
+      confidence: high
+      evidence:
+        - file: src/db.ts
+          line: 4
+          excerpt: "new Pool({ host: process.env.PGHOST, user: process.env.PGUSER })"
+        - file: package.json
+          line: 16
+          excerpt: '"pg": "^8.13.0"'
+      iamActions: []
+      # Discrete fields, not a URL — which is what makes a created database usable
+      # here. PGHOST and PGPORT come from the published parameters; PGUSER and
+      # PGPASSWORD come from the generated secret's fields.
+      connection:
+        style:
+          value: fields
+          confidence: high
+          evidence:
+            - file: src/db.ts
+              line: 4
+              excerpt: 'discrete PGHOST / PGPORT / PGUSER / PGPASSWORD, no connection string'
+        variables:
+          - name: PGHOST
+            field: host
+          - name: PGPORT
+            field: port
+          - name: PGUSER
+            field: username
+          - name: PGPASSWORD
+            field: password
+          - name: PGDATABASE
+            field: dbname
+    - kind: dynamodb
+      planId: entries-table
+      nameFound: false
+      confidence: high
+      evidence:
+        - file: src/entries.ts
+          line: 11
+          excerpt: 'new DynamoDBClient({}) — GetItem/PutItem on ENTRIES_TABLE'
+      iamActions:
+        - dynamodb:GetItem
+        - dynamodb:Query
+        - dynamodb:PutItem
+      schema:
+        partitionKey:
+          value:
+            name: accountId
+            type: string
+          confidence: high
+          evidence:
+            - file: src/entries.ts
+              line: 14
+              excerpt: 'Key: { accountId: { S: accountId }, entryId: { S: entryId } }'
+        sortKey:
+          value:
+            name: entryId
+            type: string
+          confidence: high
+          evidence:
+            - file: src/entries.ts
+              line: 14
+              excerpt: 'Key: { accountId: ..., entryId: { S: entryId } }'
+      attributeVariables:
+        - name: ENTRIES_TABLE
+          attribute: tableName
+
+  config:
+    environment:
+      - name: LOG_LEVEL
+        value: info
+    secrets: []
+
+  buildContextPaths:
+    - src/**
+    - package.json
+    - package-lock.json
+
+plan:
+  approved: true
+  resources:
+    - id: vpc
+      action: create
+      reason: No existing VPC supplied
+    - id: nat-gateway
+      action: skip
+      reason: egress.classification is none — no outbound call leaves the VPC
+    - id: vpc-endpoints
+      action: create
+      reason: >-
+        Isolated subnets require endpoints for ECR, Logs and DynamoDB, plus Secrets
+        Manager for the created database's generated credentials
+    - id: cluster
+      action: create
+      reason: No existing cluster supplied
+    - id: ecr-repository
+      action: create
+      reason: No existing repository supplied
+    - id: load-balancer
+      action: create
+      reason: Service accepts inbound HTTP on port 8080
+    - id: target-group
+      action: create
+      reason: Required by the load balancer listener
+    - id: log-group
+      action: create
+      reason: Task logging
+    - id: task-role
+      action: create
+      reason: Required by the task definition — grants read and write on the created table
+    - id: execution-role
+      action: create
+      reason: Required to pull the image, write logs, and read the created database's secret
+    - id: certificate
+      action: skip
+      reason: No public hostname recorded — listener serves HTTP only
+    - id: dns-record
+      action: skip
+      reason: No public hostname recorded
+    - id: database
+      action: create
+      parameters:
+        instanceClass: db.t4g.micro
+        engineVersion: '16.4'
+        allocatedStorageGb: 20
+        multiAz: false
+      validated: true
+      reason: >-
+        No RDS instance matching src/db.ts was found in the account — retained on stack
+        deletion, and the first platform deploy blocks for tens of minutes
+    - id: entries-table
+      action: create
+      validated: true
+      reason: >-
+        No table named in src/entries.ts exists in the account — key schema confirmed
+        from src/entries.ts:14, and the table is retained on stack deletion
+    - id: github-oidc-role
+      action: create
+      reason: Pipeline target is github-actions
+    - id: github-oidc-provider
+      action: adopt
+      identifiers:
+        providerArn: arn:aws:iam::071128183726:oidc-provider/token.actions.githubusercontent.com
+      reason: Account already has a provider for token.actions.githubusercontent.com — creating a second fails
+      validated: true
+
+pipeline:
+  target: github-actions
+  branch: main
+  repository: mbonig/ledger-api
+  roleArn: arn:aws:iam::071128183726:role/ledger-api-deploy
+  pathFilter:
+    - src/**
+    - package.json
+    - package-lock.json
+    - Dockerfile
+    - infra/lib/service-stack.ts

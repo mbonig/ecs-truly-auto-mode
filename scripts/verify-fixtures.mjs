@@ -347,6 +347,127 @@ console.log('\ncreated-vpc — an adopted OIDC provider is trusted, not recreate
   );
 }
 
+console.log('\ncreated-datastores — a create decision reaches the generated stacks:\n');
+{
+  const path = join(repo, 'examples', 'manifests', 'created-datastores.manifest.yaml');
+  const m = parseYaml(readFileSync(path, 'utf8'));
+
+  check('database is created', planEntry(m, 'database').action === 'create');
+  check('table is created', planEntry(m, 'entries-table').action === 'create');
+  check(
+    'created entries carry parameters, never identifiers',
+    !planEntry(m, 'database').identifiers && !planEntry(m, 'entries-table').identifiers,
+  );
+  check(
+    'the isolated plan provisions a Secrets Manager endpoint for the generated credentials',
+    m.analysis.egress.awsServices.includes('secretsmanager'),
+  );
+
+  const { platform, service } = synthManifest(path);
+  const p = typesOf(platform);
+  const sv = typesOf(service);
+
+  // The failure this pins down is a create decision that generated nothing at all:
+  // before this change the projection skipped any datastore entry that was not
+  // `adopt`, so the stacks came out with no database, no table, no grant and no
+  // environment variable — and synthesized and deployed cleanly.
+  check('a database instance is synthesized', p['AWS::RDS::DBInstance'] === 1, `got ${p['AWS::RDS::DBInstance']}`);
+  check('a table is synthesized', p['AWS::DynamoDB::Table'] === 1, `got ${p['AWS::DynamoDB::Table']}`);
+  check(
+    'the database generates its own credentials secret',
+    p['AWS::SecretsManager::Secret'] === 1,
+    `got ${p['AWS::SecretsManager::Secret']}`,
+  );
+
+  const database = Object.values(platform.Resources).find((r) => r.Type === 'AWS::RDS::DBInstance');
+  const table = Object.values(platform.Resources).find((r) => r.Type === 'AWS::DynamoDB::Table');
+
+  // A stack deletion that silently dropped production data would be the worst failure
+  // this tool could have, and the asymmetry is total: a retained instance costs money
+  // and is deletable by hand, a destroyed one is gone.
+  check('the database is retained on stack deletion', database.DeletionPolicy === 'Retain');
+  check('the database is deletion-protected', database.Properties.DeletionProtection === true);
+  check('the table is retained on stack deletion', table.DeletionPolicy === 'Retain');
+
+  check(
+    'the database is built to the recorded shape',
+    database.Properties.DBInstanceClass === 'db.t4g.micro' &&
+      database.Properties.EngineVersion === '16.4' &&
+      database.Properties.AllocatedStorage === '20',
+    JSON.stringify({
+      class: database.Properties.DBInstanceClass,
+      version: database.Properties.EngineVersion,
+      storage: database.Properties.AllocatedStorage,
+    }),
+  );
+
+  // A table's key schema is immutable, so this is the one shape that cannot be fixed
+  // later — it is asserted rather than assumed.
+  check(
+    'the table carries the confirmed key schema',
+    JSON.stringify(table.Properties.KeySchema) ===
+      JSON.stringify([
+        { AttributeName: 'accountId', KeyType: 'HASH' },
+        { AttributeName: 'entryId', KeyType: 'RANGE' },
+      ]),
+    JSON.stringify(table.Properties.KeySchema),
+  );
+
+  // The rule the adopt path already held to, now holding for created resources: exact
+  // ARNs, never a wildcard resource.
+  const tableStatement = Object.values(platform.Resources)
+    .filter((r) => r.Type === 'AWS::IAM::Policy')
+    .flatMap((r) => r.Properties.PolicyDocument.Statement)
+    .find((st) => st.Sid === 'EntriesTableAccess');
+  check('the task role is granted on the created table', Boolean(tableStatement));
+  check(
+    'and scoped to it rather than to a wildcard',
+    tableStatement && JSON.stringify(tableStatement.Resource).includes('Fn::GetAtt') &&
+      !JSON.stringify(tableStatement.Resource).includes('"*"'),
+    JSON.stringify(tableStatement?.Resource),
+  );
+
+  const prefix = m.target.ssmPrefix;
+  const published = Object.values(platform.Resources)
+    .filter((r) => r.Type === 'AWS::SSM::Parameter')
+    .map((r) => r.Properties.Name);
+  for (const suffix of ['database-endpoint', 'database-port', 'database-secret-arn', 'entries-table-table-name']) {
+    check(`the platform stack publishes ${suffix}`, published.includes(`${prefix}/${suffix}`));
+  }
+
+  const container = Object.values(service.Resources).find(
+    (r) => r.Type === 'AWS::ECS::TaskDefinition',
+  ).Properties.ContainerDefinitions[0];
+  const envNames = container.Environment.map((e) => e.Name);
+  const secretNames = container.Secrets.map((e) => e.Name);
+
+  // A created resource's name is a deploy-time value, so without this the table exists
+  // and the container has no way to address it.
+  check('the container reads the created table name', envNames.includes('ENTRIES_TABLE'));
+  check('the container reads the created database host and port', envNames.includes('PGHOST') && envNames.includes('PGPORT'));
+  check(
+    'the container reads the credentials from the secret, by field',
+    ['PGUSER', 'PGPASSWORD', 'PGDATABASE'].every((n) => secretNames.includes(n)),
+    JSON.stringify(secretNames),
+  );
+  check(
+    'and each is a field reference rather than a value',
+    container.Secrets.every((sec) => JSON.stringify(sec.ValueFrom).includes('::')),
+  );
+
+  // The service stack is redeployed on every push. Nothing stateful can live there.
+  const stateful = Object.keys(sv).filter((t) =>
+    /RDS|DynamoDB|SecretsManager|ElastiCache|S3::Bucket|SQS|SNS|SecurityGroup|IAM::Role/.test(t),
+  );
+  check('the service stack holds nothing stateful', stateful.length === 0, stateful.join(', '));
+  check(
+    'no credential value appears in either template',
+    !Object.values(platform.Resources).some(
+      (r) => typeof r.Properties?.MasterUserPassword === 'string' || typeof r.Properties?.SecretString === 'string',
+    ),
+  );
+}
+
 rmSync(join(cdkDir, 'lib', 'app-config.ts'), { force: true });
 rmSync(join(cdkDir, 'cdk.out'), { recursive: true, force: true });
 

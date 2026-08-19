@@ -35,6 +35,31 @@ const PROJEN_DERIVED = [
   'test/tsconfig.json', 'projenrc/tsconfig.json',
 ];
 
+/** Reached over TCP with credentials: a security group rule and a secret, no IAM. */
+const NETWORK_KINDS = new Set(['rds', 'elasticache', 'documentdb']);
+
+/** Reached through the SDK: task-role permissions and an endpoint, no security group rule. */
+const API_KINDS = new Set(['dynamodb', 's3', 'sqs', 'sns']);
+
+/**
+ * The parameters a created datastore cannot be built without, per kind.
+ *
+ * Only the values that carry a standing cost or a durability consequence are here.
+ * A table's key schema is not — it comes from the analysis with evidence, because it
+ * is read out of the code rather than chosen. Buckets, queues and topics need nothing
+ * asked at all, which is why they are absent rather than mapped to an empty list.
+ */
+const REQUIRED_CREATE_PARAMETERS = {
+  rds: ['instanceClass', 'engineVersion', 'allocatedStorageGb', 'multiAz'],
+  documentdb: ['instanceClass', 'instanceCount'],
+  elasticache: ['nodeType', 'engine'],
+};
+
+/** The datastore's plan entry, by the link the manifest records. */
+function datastoreEntry(manifest, store) {
+  return store.planId ? findResource(manifest, store.planId) : undefined;
+}
+
 /** Cross-field invariants. Each returns an array of human-readable problems. */
 const consistencyChecks = [
   function planApprovalRequiresValidatedBuild(m) {
@@ -109,6 +134,124 @@ const consistencyChecks = [
       }
     }
     return problems;
+  },
+
+  function createParametersOnlyOnCreate(m) {
+    const problems = [];
+    for (const r of m.plan?.resources ?? []) {
+      if (r.action === 'create') continue;
+      if (r.parameters) {
+        problems.push(`plan resource "${r.id}" is "${r.action}" but carries parameters [${Object.keys(r.parameters).join(', ')}] — only a created resource is built to a chosen shape, so these would be silently ignored`);
+      }
+    }
+    return problems;
+  },
+
+  function datastoresLinkToAPlanEntry(m) {
+    const problems = [];
+    for (const store of m.analysis?.datastores ?? []) {
+      if (!store.planId) {
+        problems.push(`analysis datastore of kind "${store.kind}" records no planId — without it the datastore cannot be matched to its create-or-adopt decision, and generation would drop it`);
+        continue;
+      }
+      if (!datastoreEntry(m, store)) {
+        problems.push(`analysis datastore of kind "${store.kind}" names planId "${store.planId}", which is not in plan.resources`);
+      }
+    }
+    return problems;
+  },
+
+  function createdDatastoreParametersArePresent(m) {
+    const problems = [];
+    for (const store of m.analysis?.datastores ?? []) {
+      const entry = datastoreEntry(m, store);
+      if (entry?.action !== 'create') continue;
+      const required = REQUIRED_CREATE_PARAMETERS[store.kind];
+      if (!required) continue;
+      const missing = required.filter((k) => entry.parameters?.[k] === undefined);
+      if (missing.length) {
+        problems.push(`plan resource "${entry.id}" is "create" for a ${store.kind} datastore but records no [${missing.join(', ')}] in parameters — these carry a standing cost or a durability consequence, so they are asked rather than defaulted`);
+      }
+    }
+    return problems;
+  },
+
+  function createdTableHasConfirmedKeySchema(m) {
+    const problems = [];
+    for (const store of m.analysis?.datastores ?? []) {
+      if (store.kind !== 'dynamodb') continue;
+      const entry = datastoreEntry(m, store);
+      if (entry?.action !== 'create') continue;
+
+      const pk = store.schema?.partitionKey;
+      if (!pk) {
+        problems.push(`plan resource "${entry.id}" is "create" for a DynamoDB table but the analysis records no key schema — a table's key schema is immutable, so a table created on a guess is deleted and rebuilt rather than altered`);
+        continue;
+      }
+      if (pk.confidence !== 'high' && !pk.confirmedByUser) {
+        problems.push(`plan resource "${entry.id}" is "create" for a DynamoDB table whose partition key is "${pk.confidence}" confidence and unconfirmed — a table's key schema is immutable, so this one has to be asked about rather than defaulted`);
+      }
+    }
+    return problems;
+  },
+
+  function createdDatabaseCredentialsAreResolvable(m) {
+    const problems = [];
+    const secretNames = new Set((m.analysis?.config?.secrets ?? []).filter((sec) => sec.arn).map((sec) => sec.name));
+
+    for (const store of m.analysis?.datastores ?? []) {
+      if (!NETWORK_KINDS.has(store.kind)) continue;
+      const entry = datastoreEntry(m, store);
+      if (entry?.action !== 'create') continue;
+
+      const style = store.connection?.style?.value;
+      if (!style) {
+        problems.push(`plan resource "${entry.id}" is "create" for a ${store.kind} datastore but the analysis records no connection style — whether the application reads discrete fields or a single URL decides whether a generated secret can serve it at all`);
+        continue;
+      }
+      if (style !== 'url') continue;
+
+      // A generated secret holds host, port, username, password and dbname. It does
+      // not hold an assembled URL, and composing one would mean reading the password.
+      const urlVariables = (store.connection.variables ?? []).map((v) => v.name);
+      const covered = urlVariables.filter((name) => secretNames.has(name));
+      if (covered.length !== urlVariables.length) {
+        const uncovered = urlVariables.filter((name) => !secretNames.has(name));
+        problems.push(`plan resource "${entry.id}" is "create" for a ${store.kind} datastore, but the application reads [${uncovered.join(', ')}] as a single connection URL and a generated secret cannot supply one — either record an existing secret holding the URL for each of those variables, or record connection.style "fields" and adapt the application to read the discrete fields`);
+      }
+    }
+    return problems;
+  },
+
+  function unidentifiedDatastoreIsAdoptOnly(m) {
+    const problems = [];
+    for (const store of m.analysis?.datastores ?? []) {
+      const entry = datastoreEntry(m, store);
+      if (entry?.action !== 'create') continue;
+
+      if (store.kind === 'other') {
+        problems.push(`plan resource "${entry.id}" is "create" for a datastore of kind "other" — the skill cannot create a resource it was unable to identify, so this one can only be adopted`);
+      }
+      if (store.kind === 'rds' && store.engine?.startsWith('aurora')) {
+        problems.push(`plan resource "${entry.id}" is "create" for engine "${store.engine}" — an Aurora cluster's writer and reader topology is not derivable from application code, and a single-instance cluster misrepresents it, so an Aurora engine can only be adopted`);
+      }
+    }
+    return problems;
+  },
+
+  function endpointSetCoversCreatedDatastores(m) {
+    if (m.analysis?.egress?.classification?.value !== 'none') return [];
+
+    const createsGeneratedSecret = (m.analysis?.datastores ?? []).some((store) => {
+      if (!NETWORK_KINDS.has(store.kind)) return false;
+      return datastoreEntry(m, store)?.action === 'create';
+    });
+    if (!createsGeneratedSecret) return [];
+
+    if (!(m.analysis.egress.awsServices ?? []).includes('secretsmanager')) {
+      return ['egress.classification is "none" and a network-reached datastore is created with generated credentials, but egress.awsServices omits "secretsmanager" — on Fargate the credential fetch leaves through the task\'s own network interface, so an isolated task without that endpoint cannot start, and the failure names Secrets Manager rather than the database'];
+    }
+    return [];
   },
 
   function approvedPlanHasNoUnconfirmedFindings(m) {

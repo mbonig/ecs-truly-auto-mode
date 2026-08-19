@@ -79,9 +79,14 @@ analysis:
   datastores:
     - kind: rds
       engine: postgres
+      planId: database
+      nameFound: false
       evidence: [...]
       confidence: high
       iamActions: []
+      connection:
+        style:     { value: fields, confidence: high, evidence: [...] }
+        variables: [ { name: PGHOST, field: host }, { name: PGPASSWORD, field: password } ]
   config:
     environment: [ { name: LOG_LEVEL, value: info } ]
     secrets:     [ { name: DATABASE_PASSWORD, evidence: [...], confidence: high } ]
@@ -109,11 +114,68 @@ analysis:
 
 | Field | Type | Notes |
 | --- | --- | --- |
-| `kind` | `rds` \| `dynamodb` \| `elasticache` \| `s3` \| `other` | |
-| `engine` | string | For `rds`: `postgres`, `mysql`, etc. |
+| `kind` | `rds` \| `dynamodb` \| `elasticache` \| `documentdb` \| `s3` \| `sqs` \| `sns` \| `other` | `other` is adopt-only: the skill cannot create what it could not identify. |
+| `engine` | string | For `rds`: `postgres`, `mysql`, etc. An `aurora-*` engine is adopt-only. |
 | `evidence` | array | Supporting evidence. |
 | `confidence` | see below | |
 | `iamActions` | array of string | Actions granted to the task role. Empty for network-reached stores like RDS. |
+| `planId` | string | **The entry in `plan.resources` this datastore is decided by.** |
+| `nameFound` | boolean | Whether a name exists to look up in the account. |
+| `schema` | object | A table's key shape. Required before `create`. |
+| `connection` | object | How a network-reached store is reached. Required before `create`. |
+| `attributeVariables` | array of `{name, attribute}` | Environment variables carrying an API-reached resource's name. |
+
+`planId` is the link between a finding and its create-or-adopt decision, and it is not
+optional. The network-reached kinds map onto fixed ids (`database`, `cache`), but an
+API-reached entry's id names its role — `receipts-bucket`, `sessions-table` — so two
+buckets are indistinguishable without it. An adopted entry could once be matched by its
+identifiers; a created one has none.
+
+`nameFound` decides which branch planning takes: `true` runs one targeted account lookup,
+`false` means there is nothing to look up, so the entry is asked about rather than the
+account enumerated. Absent means `false`.
+
+#### `schema` — a table's key shape
+
+```yaml
+schema:
+  partitionKey:
+    value: { name: sessionId, type: string }   # string | number | binary
+    confidence: high
+    evidence: [ { file: app/sessions.py, line: 14 } ]
+  sortKey:   { value: { name: createdAt, type: number }, confidence: high, evidence: [...] }
+  indexes:
+    - name: by-account
+      partitionKey: { name: accountId, type: string }
+```
+
+`partitionKey` and `sortKey` are **findings**, carrying evidence and a confidence level;
+the index entries are not, because an index is only recorded when the code was found to
+query it. A `create` decision requires `partitionKey` at `high` confidence or
+`confirmedByUser` — a table's key schema is immutable, so there is no default here at any
+confidence level.
+
+#### `connection` — how a network-reached store is reached
+
+```yaml
+connection:
+  style:
+    value: fields                              # fields | url
+    confidence: high
+    evidence: [ { file: src/db.ts, line: 4 } ]
+  variables:
+    - { name: PGHOST,     field: host }         # host | port | username | password | dbname
+    - { name: PGPASSWORD, field: password }
+```
+
+The `style` decides whether a **created** datastore is usable: a generated secret holds
+discrete fields and cannot hold an assembled URL. `style: url` plus a `create` decision is
+an incomplete plan — see
+[resource-catalog.md](./planning/resource-catalog.md#database).
+
+`host` and `port` are served from the published endpoint parameters rather than from the
+secret; the rest are injected as secret fields. Like `secrets`, this object records names
+and fields only — **there is no property in it that could hold a value.**
 
 ## Finding records
 
@@ -201,11 +263,18 @@ plan:
 | `resources[].id` | string | Key from the resource catalog. |
 | `resources[].action` | `create` \| `adopt` \| `skip` | |
 | `resources[].identifiers` | object | **Required and non-empty when `action: adopt`.** Shape is per-resource; see the resource catalog. |
+| `resources[].parameters` | object | **Only valid when `action: create`.** The chosen shape of a resource being built. |
 | `resources[].reason` | string | Why this action. Shown in the plan. |
 | `resources[].validated` | boolean | Set when an adopted identifier was verified against AWS. |
 
 A plan containing any `adopt` entry with missing identifiers is **incomplete**, and
 generation does not run regardless of `approved`.
+
+`identifiers` and `parameters` are mirror images: the first says what to *import*, the
+second says what to *build*. They are separate fields rather than one bag because a
+created resource has nothing to import and an adopted one has no shape to choose, so a
+value in the wrong one would apply to nothing at all — silently. The validator rejects
+each on the wrong action for that reason.
 
 Identifiers are shape-checked per resource by the resource catalog rather than by the
 JSON Schema, which only requires that an adopted entry carries at least one. Two
@@ -216,6 +285,9 @@ failure rather than a generation failure:
 | --- | --- | --- |
 | `certificate` | Issue a DNS-validated certificate against the adopted hosted zone. Requires `hosted-zone` to be `adopt`. | `certificateArn` |
 | `github-oidc-provider` | The target account has no provider for `token.actions.githubusercontent.com`, so create one. | `providerArn` |
+| `database` | Build a single-instance relational or document database, retained and deletion-protected, with generated credentials. Needs `parameters`. | `dbInstanceIdentifier`, `endpointAddress`, `port`, `securityGroupId` |
+| `cache` | Build an ElastiCache cluster, retained. Needs `parameters`. | `cacheClusterId`, `endpointAddress`, `port`, `securityGroupId` |
+| bucket / table / queue / topic | Build the resource to a fixed shape, retained. A table also needs a confirmed key schema. | `bucketName` / `tableName` / `queueUrl` / `topicArn` |
 
 The `github-oidc-provider` entry is **required** when `pipeline.target` is
 `github-actions`. It is not optional and it does not default: the generated role

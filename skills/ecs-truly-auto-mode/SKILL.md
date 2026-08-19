@@ -73,26 +73,48 @@ Read [resource-catalog.md](./references/planning/resource-catalog.md) and
 [plan-presentation.md](./references/planning/plan-presentation.md).
 
 1. Derive the resource list from the findings.
-2. Ask the two generation-shape questions **together** — neither depends on the
+2. **Look before asking.** Two entry groups are decided by checking the target account
+   rather than by a question — the GitHub OIDC provider, and every detected datastore.
+   Run those lookups first, keyed on the name the analysis recorded, per
+   [adopt-validation.md](./references/planning/adopt-validation.md#datastores-discovery-then-the-decision).
+   A match records `adopt` with the identifiers filled in and asks nothing. A lookup that
+   succeeded and found nothing offers `create`. **A lookup that could not run is never
+   read as absence** — it falls through to a question, because "there is none" and "I
+   could not check" call for opposite actions.
+3. Ask the two generation-shape questions **together** — neither depends on the
    analysis, so asking them separately spends two rounds on one decision point:
    - **Pipeline target** — GitHub Actions or CodePipeline. It adds resources to the plan.
    - **Infrastructure project style** — `plain` (default) or `projen`. See
      [iac-style.md](./references/generation/iac-style.md). Ask it; do not infer it
      from a projen file elsewhere in the repository.
-3. Present the plan, ordered by consequence, with the egress classification and its
+4. Present the plan, ordered by consequence, with the egress classification and its
    evidence as the headline item.
-4. Collect create-or-adopt for each entry, and identifiers for every adopted one.
-   Validate them against AWS per
+5. Collect create-or-adopt for each remaining entry, identifiers for every adopted one,
+   and `parameters` for every created datastore. Validate identifiers against AWS per
    [adopt-validation.md](./references/planning/adopt-validation.md) when credentials
    are available; record `validated: false` and say so when they are not.
-5. Collect the target account and region **explicitly**. Do not inherit a region
+6. Derive `vpc-endpoints` **after** the datastore decisions, not from the egress
+   classification alone. A created database generates its own credentials secret, which
+   on Fargate the ECS agent fetches through the task's own network interface — so an
+   isolated workload that needed no Secrets Manager endpoint needs one the moment the
+   database becomes `create`, and without it the task cannot start.
+7. Collect the target account and region **explicitly**. Do not inherit a region
    from the environment — a profile may not define one, and a silently-wrong region
    is expensive to discover.
-6. Verify completeness, then ask for approval.
+8. Verify completeness, then ask for approval.
 
 **The gate:** generation does not run unless `plan.approved` is `true` **and** every
-`adopt` entry has non-empty identifiers **and** every finding is `high` or
-`confirmedByUser`. Say exactly what is missing rather than proceeding partway.
+`adopt` entry has non-empty identifiers **and** every created datastore has the parameters
+its kind requires **and** every finding is `high` or `confirmedByUser`. Two datastore
+cases fail the gate specifically, and both are worth naming rather than working around:
+
+- A created **table** whose key schema is below `high` and unconfirmed. The key schema is
+  immutable, so this is the one shape that cannot be corrected after the fact.
+- A created **database** whose application reads a single URL-shaped connection variable.
+  A generated secret holds discrete fields, not an assembled URL. Offer the two
+  resolutions; do not fall back to `adopt`.
+
+Say exactly what is missing rather than proceeding partway.
 
 ---
 
@@ -210,9 +232,18 @@ Report:
    branch. It is not deployed by hand and not deployed by the platform stack.
 4. **What the user must do** — create secrets that don't exist yet, complete a
    CodeConnections handshake, point DNS.
-5. **Adopted resources this depends on**, so a later change to one is understood to
+5. **Created datastores, and what they imply.** Two things the user will not otherwise
+   find out until it costs them:
+   - A created database comes up **empty**. Schema migrations are not generated and the
+     pipeline does not run them, so a repository with a `migrations/` directory still
+     needs that step. Say it even when it seems obvious — it is the gap between a
+     deploy that succeeds and an application that works.
+   - Created datastores are **retained on stack deletion**, and databases are
+     deletion-protected. `cdk destroy` leaves them, and their bill, behind. Name them,
+     so a later teardown is not a surprise.
+6. **Adopted resources this depends on**, so a later change to one is understood to
    affect this service.
-6. **Expected synth warnings.** `cdk synth` reports template-validation warnings on
+7. **Expected synth warnings.** `cdk synth` reports template-validation warnings on
    the service stack about subnet IDs and role ARNs "not matching expected format".
    These are false positives: the linter evaluates each SSM parameter's default,
    which is the parameter path, while CloudFormation resolves the real value at
