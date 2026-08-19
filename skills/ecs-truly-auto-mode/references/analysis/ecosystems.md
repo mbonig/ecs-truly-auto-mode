@@ -117,6 +117,17 @@ from the dependency list. Search for `boto3.client(` and `boto3.resource(` and
 collect every literal. A non-literal service name means the set cannot be determined
 statically — ask.
 
+`boto3.client("dsql")` is a distinct signal worth naming on its own: it is Aurora
+DSQL's IAM auth-token generator, not a network call — see
+[datastores.md](./datastores.md#aurora-dsql). It shows up alongside a PostgreSQL
+driver (`psycopg`, `psycopg2`, `asyncpg`) and a call to
+`generate_db_connect_auth_token` or `generate_db_connect_admin_auth_token`. Because
+"collect every `boto3.client(` literal" already surfaces `dsql` as a used service,
+it is easy to over-read that as "this app needs the `dsql` VPC endpoint" — it does
+not; connecting needs the *data-plane* endpoint, not the client the token generator
+happens to construct. See
+[egress.md](./egress.md#aws-services-to-vpc-endpoints) for the distinction.
+
 ### Config
 
 `os.environ["X"]`, `os.getenv("X")`, `pydantic_settings.BaseSettings` subclasses

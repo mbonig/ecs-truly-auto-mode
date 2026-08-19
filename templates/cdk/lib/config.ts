@@ -18,7 +18,8 @@ export type EgressClassification = 'none' | 'public';
  */
 export type AwsServiceKey =
   | 'ecr' | 'ecr-docker' | 'logs' | 'secretsmanager' | 'ssm'
-  | 's3' | 'dynamodb' | 'sqs' | 'sns' | 'kms' | 'sts' | 'events';
+  | 's3' | 'dynamodb' | 'sqs' | 'sns' | 'kms' | 'sts' | 'events'
+  | 'dsql-data' | 'dsql';
 
 /**
  * Networking is either created or imported from explicit attributes. There is
@@ -217,6 +218,49 @@ export type CreatedApiDatastore = {
   | { readonly kind: 'sns' }
 );
 
+/**
+ * An IAM-authenticated network datastore: reached over TCP like a database, but
+ * authorised by IAM like an API. Neither `NetworkDatastore` nor `ApiDatastore` can
+ * express Aurora DSQL without lying — it has a port and an endpoint like the former,
+ * but no security group and no password like the latter. It is a third category, not
+ * a variation on the other two.
+ *
+ * There is deliberately no `SecretRef` and no `DatabaseCredentials` for this kind: the
+ * driver authenticates with a short-lived SigV4 token signed by the task role, so no
+ * password exists anywhere in the system. Recording one would be a bug, not an omission.
+ */
+export type IamAuthDatastore = {
+  readonly id: string;
+  readonly kind: 'dsql';
+  /** PostgreSQL wire protocol for DSQL. */
+  readonly port: number;
+  /** `dsql:DbConnect` for a named database role, `dsql:DbConnectAdmin` for `admin`. */
+  readonly actions: string[];
+  /** The database role the application logs in as. `admin` is the superuser. */
+  readonly dbUser: string;
+} & (
+  | {
+      readonly mode: 'adopt';
+      readonly clusterIdentifier: string;
+      /**
+       * The data-plane VPC endpoint service to connect through when `egress` is
+       * `none`. Absent when `egress` is `public` — there is nothing to build. The
+       * service name is region-specific and opaque, so it is resolved once during
+       * planning and recorded here rather than derived.
+       */
+      readonly vpcEndpointServiceName?: string;
+    }
+  | {
+      readonly mode: 'create';
+      /**
+       * SSM parameter suffix the platform stack publishes the cluster's endpoint
+       * under. Recorded here rather than derived independently in two places — same
+       * reasoning as `CreatedNetworkDatastore.endpointParameter`.
+       */
+      readonly endpointParameter: string;
+    }
+);
+
 export interface TableAttribute {
   readonly name: string;
   readonly type: 'string' | 'number' | 'binary';
@@ -297,6 +341,7 @@ export interface AppConfig {
 
   readonly networkDatastores: NetworkDatastore[];
   readonly apiDatastores: ApiDatastore[];
+  readonly iamAuthDatastores: IamAuthDatastore[];
 
   readonly environment: Record<string, string>;
   /**

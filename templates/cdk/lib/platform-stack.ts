@@ -31,7 +31,8 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
-import { AppConfig, AwsServiceKey, CreatedApiDatastore, TableAttribute } from './config';
+import * as dsql from 'aws-cdk-lib/aws-dsql';
+import { AppConfig, AwsServiceKey, CreatedApiDatastore, IamAuthDatastore, TableAttribute } from './config';
 import { GitHubOidcRole } from './deploy-permissions';
 
 export interface PlatformStackGitHubActions {
@@ -60,6 +61,27 @@ export interface PlatformStackProps extends cdk.StackProps {
    * instead.
    */
   readonly githubActions?: PlatformStackGitHubActions;
+}
+
+/**
+ * What the rest of the stack needs to know about one IAM-authenticated datastore,
+ * once it has been either created here or resolved from the plan.
+ *
+ * Resolving this once is what keeps the endpoint/egress coupling from being repeated:
+ * the hostname the task connects to is not the same string in isolated and public
+ * modes, and the certificate the server presents is cut for whichever one is correct.
+ * Choosing the wrong one does not fail closed — the connection hangs until the
+ * driver's connect timeout.
+ */
+interface IamAuthDatastoreRefs {
+  readonly store: IamAuthDatastore;
+  /** `arn:aws:dsql:<region>:<account>:cluster/<id>` — what the task role is scoped to. */
+  readonly clusterArn: string;
+  /**
+   * The endpoint service to put an interface endpoint on, for isolated placement.
+   * Absent when `egress` is `public` — there is nothing to build.
+   */
+  readonly endpointServiceName?: string;
 }
 
 export class PlatformStack extends cdk.Stack {
@@ -100,11 +122,16 @@ export class PlatformStack extends cdk.Stack {
 
     this.vpc = this.buildVpc();
 
+    // Before the endpoints, deliberately: an isolated task reaches DSQL through a
+    // data-plane interface endpoint whose service name this resolves, either off the
+    // created cluster's own attribute or off the plan's recorded value.
+    const iamAuthDatastores = this.buildIamAuthDatastores();
+
     // Isolated placement means no NAT, so every AWS call the task makes has to go
     // through a VPC endpoint. See references/analysis/egress.md for why this is the
     // decision worth getting right.
     if (config.egress === 'none') {
-      this.addVpcEndpoints(this.vpc);
+      this.addVpcEndpoints(this.vpc, iamAuthDatastores);
     }
 
     this.cluster = this.buildCluster(this.vpc);
@@ -121,8 +148,17 @@ export class PlatformStack extends cdk.Stack {
     this.wireNetworkDatastores(taskSecurityGroup, executionRole);
 
     // Created API-reached resources have no ARN until they exist, so they are built
-    // first and the task role is granted against what came back.
-    const taskRole = this.buildTaskRole(this.buildApiDatastores());
+    // first and the task role is granted against what came back. IAM-authenticated
+    // datastores join the same grant list: the connection itself is authorised here,
+    // by the task role, rather than by a password.
+    const taskRole = this.buildTaskRole([
+      ...this.buildApiDatastores(),
+      ...iamAuthDatastores.map((ref) => ({
+        id: ref.store.id,
+        actions: ref.store.actions,
+        resourceArns: [ref.clusterArn],
+      })),
+    ]);
 
     const targetGroup = config.loadBalancer
       ? this.buildLoadBalancing(this.vpc, taskSecurityGroup)
@@ -190,7 +226,7 @@ export class PlatformStack extends cdk.Stack {
    * gateway endpoints. Endpoints are not free — an interface endpoint bills hourly
    * per AZ — so this provisions what is used rather than everything available.
    */
-  private addVpcEndpoints(vpc: ec2.IVpc): void {
+  private addVpcEndpoints(vpc: ec2.IVpc, iamAuthDatastores: IamAuthDatastoreRefs[]): void {
     const endpointSg = new ec2.SecurityGroup(this, 'EndpointSecurityGroup', {
       vpc,
       description: 'Allows tasks to reach VPC interface endpoints over 443',
@@ -213,6 +249,12 @@ export class PlatformStack extends cdk.Stack {
       kms: ec2.InterfaceVpcEndpointAwsService.KMS,
       sts: ec2.InterfaceVpcEndpointAwsService.STS,
       events: ec2.InterfaceVpcEndpointAwsService.EVENTBRIDGE,
+      // The DSQL *control* plane — CreateCluster, ListClusters. Present only when the
+      // application actually manages clusters. Generating a connection auth token does
+      // not call it: `generate_db_connect_auth_token` and its admin twin are local
+      // SigV4 presigners that make no request at all. An app that only connects and is
+      // handed this endpoint pays roughly $7/mo per AZ for nothing.
+      dsql: ec2.InterfaceVpcEndpointAwsService.DSQL_MANAGEMENT,
     };
 
     for (const key of this.config.awsServices) {
@@ -241,6 +283,50 @@ export class PlatformStack extends cdk.Stack {
         vpc,
         service: ec2.GatewayVpcEndpointAwsService.DYNAMODB,
         subnets: [this.appSubnets],
+      });
+    }
+
+    this.addDsqlDataPlaneEndpoints(vpc, endpointSg, iamAuthDatastores);
+  }
+
+  /**
+   * Interface endpoints for the DSQL *data plane*, one per cluster in the plan.
+   *
+   * Aurora DSQL is reached over the PostgreSQL wire protocol, so unlike every other
+   * endpoint here this one is not HTTPS on 443 — the ENI has to accept 5432, and the
+   * shared endpoint security group is opened for it only when such an endpoint exists.
+   *
+   * The endpoint service name is region-specific and opaque
+   * (`com.amazonaws.us-east-1.dsql-fnh4`), so it comes from the cluster's own
+   * `VpcEndpointServiceName` attribute on the create path and from a planning-time
+   * lookup on the adopt path — never hardcoded, which would synthesize a stack that
+   * deploys in one region and fails in every other.
+   *
+   * `privateDnsEnabled` matters more here than usual: `InterfaceVpcEndpointService`
+   * defaults it off, and without it the driver resolves the public hostname and hangs
+   * rather than failing.
+   */
+  private addDsqlDataPlaneEndpoints(
+    vpc: ec2.IVpc,
+    endpointSg: ec2.SecurityGroup,
+    iamAuthDatastores: IamAuthDatastoreRefs[],
+  ): void {
+    const withEndpointService = iamAuthDatastores.filter((ref) => ref.endpointServiceName);
+    if (withEndpointService.length === 0) return;
+
+    endpointSg.addIngressRule(
+      ec2.Peer.ipv4(vpc.vpcCidrBlock),
+      ec2.Port.tcp(5432),
+      'PostgreSQL wire protocol to the DSQL data plane from within the VPC',
+    );
+
+    for (const ref of withEndpointService) {
+      new ec2.InterfaceVpcEndpoint(this, `EndpointDsql${pascal(ref.store.id)}`, {
+        vpc,
+        service: new ec2.InterfaceVpcEndpointService(ref.endpointServiceName!, ref.store.port),
+        subnets: this.appSubnets,
+        securityGroups: [endpointSg],
+        privateDnsEnabled: true,
       });
     }
   }
@@ -525,6 +611,58 @@ export class PlatformStack extends cdk.Stack {
 
     this.recordParameter(store.endpointParameter, cluster.attrConfigurationEndpointAddress);
     this.recordParameter(store.portParameter, cluster.attrConfigurationEndpointPort);
+  }
+
+  /**
+   * Create or resolve every IAM-authenticated datastore in the plan.
+   *
+   * A created cluster is the one place this tool creates a stateful resource outside
+   * the datastore-create paths above, and the same two guards apply: deletion
+   * protection on the cluster itself, and `RemovalPolicy.RETAIN` on the stack's claim
+   * to it. DSQL is serverless with no capacity or version to choose and provisions in
+   * about 30 seconds, which is what makes offering `create` here defensible.
+   *
+   * Unlike `wireNetworkDatastores`, this runs before the VPC endpoints are decided —
+   * an isolated task reaches DSQL through a data-plane interface endpoint, and this is
+   * where that endpoint's service name is resolved.
+   */
+  private buildIamAuthDatastores(): IamAuthDatastoreRefs[] {
+    return this.config.iamAuthDatastores.map((store) => {
+      if (store.mode === 'create') {
+        const cluster = new dsql.CfnCluster(this, `DsqlCluster${pascal(store.id)}`, {
+          deletionProtectionEnabled: true,
+          tags: [{ key: 'Name', value: `${this.config.name}-${store.id}` }],
+        });
+        // Deleting the stack must not delete the database. Deletion protection alone
+        // would not do it — it would fail the stack deletion instead of releasing the
+        // cluster, which is a worse outcome than an orphan.
+        cluster.applyRemovalPolicy(cdk.RemovalPolicy.RETAIN);
+
+        // The two endpoint attributes are different hostnames, and the certificate the
+        // server presents is cut for whichever one is correct — see
+        // references/analysis/egress.md#3-the-endpoint-the-task-connects-to.
+        this.recordParameter(
+          store.endpointParameter,
+          this.config.egress === 'none' ? cluster.attrVpcEndpoint : cluster.attrEndpoint,
+        );
+
+        return {
+          store,
+          clusterArn: cluster.attrResourceArn,
+          endpointServiceName:
+            this.config.egress === 'none' ? cluster.attrVpcEndpointServiceName : undefined,
+        };
+      }
+
+      return {
+        store,
+        clusterArn: cdk.Arn.format(
+          { service: 'dsql', resource: 'cluster', resourceName: store.clusterIdentifier },
+          this,
+        ),
+        endpointServiceName: this.config.egress === 'none' ? store.vpcEndpointServiceName : undefined,
+      };
+    });
   }
 
   private buildExecutionRole(): iam.IRole {

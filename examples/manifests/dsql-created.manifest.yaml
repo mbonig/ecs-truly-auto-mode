@@ -1,0 +1,171 @@
+# Example manifest: Aurora DSQL is the one datastore this tool may create — it is
+# serverless with no capacity or version to choose, and provisions in about 30
+# seconds rather than the tens of minutes RDS or DocumentDB take. Isolated egress, so
+# the platform stack also has to resolve the cluster's own data-plane VPC endpoint
+# service name rather than a hardcoded one — see references/analysis/egress.md.
+schemaVersion: 1
+
+app:
+  name: hello-api
+  dockerfile: Dockerfile
+  buildContext: .
+
+target:
+  account: '071128183726'
+  region: us-east-1
+  ssmPrefix: /ecs-auto-mode/hello-api
+
+analysis:
+  buildValidated: true
+
+  architecture:
+    value: ARM64
+    confidence: high
+    evidence:
+      - file: Dockerfile
+        line: 1
+        excerpt: 'FROM --platform=linux/arm64 node:22-alpine'
+
+  container:
+    port:
+      value: 8080
+      confidence: high
+      evidence:
+        - file: Dockerfile
+          line: 14
+          excerpt: 'EXPOSE 8080'
+        - file: src/server.ts
+          line: 22
+          excerpt: 'app.listen(8080, () => ...)'
+    healthCheck:
+      type:
+        value: http
+        confidence: high
+        evidence:
+          - file: src/server.ts
+            line: 11
+            excerpt: "app.get('/health', (_req, res) => res.sendStatus(200))"
+      path:
+        value: /health
+        confidence: high
+        evidence:
+          - file: src/server.ts
+            line: 11
+            excerpt: "app.get('/health', ...)"
+
+  egress:
+    classification:
+      value: none
+      confidence: high
+      evidence:
+        - file: src/db.ts
+          excerpt: 'DSQL is reached through its data-plane VPC endpoint; no call leaves the VPC'
+    awsServices:
+      - ecr
+      - ecr-docker
+      - logs
+      - dsql-data
+    externalHosts: []
+
+  hostnames:
+    public: []
+    internal: []
+
+  datastores:
+    - kind: dsql
+      planId: dsql-cluster
+      nameFound: false
+      confidence: high
+      evidence:
+        - file: src/db.ts
+          line: 4
+          excerpt: "new DsqlSigner({ hostname: process.env.DSQL_CLUSTER_ENDPOINT, region: 'us-east-1' })"
+        - file: src/db.ts
+          line: 9
+          excerpt: 'const client = new pg.Client({ host: process.env.DSQL_CLUSTER_ENDPOINT, ... })'
+      iamActions:
+        - 'dsql:DbConnect'
+      dbUser: app_user
+      endpointEnvVar: DSQL_CLUSTER_ENDPOINT
+
+  config:
+    environment:
+      - name: LOG_LEVEL
+        value: info
+    secrets: []
+
+  buildContextPaths:
+    - src/**
+    - package.json
+    - package-lock.json
+    - tsconfig.json
+
+plan:
+  approved: true
+  resources:
+    - id: vpc
+      action: create
+      reason: No existing VPC supplied
+    - id: nat-gateway
+      action: skip
+      reason: egress.classification is none — DSQL is reached over its data-plane VPC endpoint
+    - id: vpc-endpoints
+      action: create
+      reason: Isolated subnets require interface endpoints for ECR, CloudWatch Logs, and the DSQL data plane
+    - id: cluster
+      action: create
+      reason: No existing cluster supplied
+    - id: ecr-repository
+      action: create
+      reason: No existing repository supplied
+    - id: load-balancer
+      action: create
+      reason: Service accepts inbound HTTP on port 8080
+    - id: target-group
+      action: create
+      reason: Required by the load balancer listener
+    - id: log-group
+      action: create
+      reason: Task logging
+    - id: task-role
+      action: create
+      reason: Required by the task definition — grants dsql:DbConnect on the created cluster
+    - id: execution-role
+      action: create
+      reason: Required to pull the image and write logs
+    - id: certificate
+      action: skip
+      reason: No public hostname recorded — listener serves HTTP only
+    - id: dns-record
+      action: skip
+      reason: No public hostname recorded
+    - id: dsql-cluster
+      action: create
+      validated: true
+      reason: >-
+        No DSQL cluster matching src/db.ts was found in the account. DSQL is serverless
+        with no capacity or version to choose — the one exception to "the skill never
+        creates a database." The platform stack retains the cluster and enables
+        deletion protection.
+    - id: github-oidc-role
+      action: create
+      reason: Pipeline target is github-actions
+    - id: github-oidc-provider
+      action: adopt
+      identifiers:
+        providerArn: arn:aws:iam::071128183726:oidc-provider/token.actions.githubusercontent.com
+      reason: Account already has a provider for token.actions.githubusercontent.com — creating a second fails
+      validated: true
+
+pipeline:
+  target: github-actions
+  branch: main
+  repository: mbonig/hello-api
+  roleArn: arn:aws:iam::071128183726:role/hello-api-deploy
+  pathFilter:
+    - src/**
+    - package.json
+    - package-lock.json
+    - tsconfig.json
+    - Dockerfile
+    - infra/lib/service-stack.ts

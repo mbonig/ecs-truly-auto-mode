@@ -42,6 +42,13 @@ const NETWORK_KINDS = new Set(['rds', 'elasticache', 'documentdb']);
 const API_KINDS = new Set(['dynamodb', 's3', 'sqs', 'sns']);
 
 /**
+ * Reached over TCP like a database, authorised by IAM like an API. Aurora DSQL has a
+ * port and an endpoint like a network-reached store, but no security group and no
+ * password like an API-reached one — neither set above.
+ */
+const IAM_AUTH_KINDS = new Set(['dsql']);
+
+/**
  * The parameters a created datastore cannot be built without, per kind.
  *
  * Only the values that carry a standing cost or a durability consequence are here.
@@ -237,6 +244,64 @@ const consistencyChecks = [
       }
     }
     return problems;
+  },
+
+  function dsqlDatastoreRecordsEndpointEnvVar(m) {
+    const problems = [];
+    for (const store of m.analysis?.datastores ?? []) {
+      if (!IAM_AUTH_KINDS.has(store.kind)) continue;
+      const entry = datastoreEntry(m, store);
+      if (!entry) continue;
+
+      if (!store.endpointEnvVar) {
+        problems.push(`analysis datastore of kind "${store.kind}" (planId "${store.planId}") records no endpointEnvVar — the environment variable the container reads the endpoint from must be named, learned from the code that reads it`);
+        continue;
+      }
+
+      if (entry.action === 'adopt') {
+        const recorded = (m.analysis?.config?.environment ?? []).some((e) => e.name === store.endpointEnvVar);
+        if (!recorded) {
+          problems.push(`analysis.config.environment records no literal for "${store.endpointEnvVar}" — an adopted dsql cluster's endpoint is known at plan time, so it belongs there rather than in a created resource's deploy-time projection`);
+        }
+      }
+    }
+    return problems;
+  },
+
+  function dsqlClusterCarriesRequiredIdentifiers(m) {
+    const problems = [];
+    for (const store of m.analysis?.datastores ?? []) {
+      if (!IAM_AUTH_KINDS.has(store.kind)) continue;
+      const entry = datastoreEntry(m, store);
+      if (entry?.action !== 'adopt') continue;
+
+      const ids = entry.identifiers ?? {};
+      if (!ids.clusterIdentifier) {
+        problems.push(`plan resource "${entry.id}" is adopted for a dsql datastore but records no clusterIdentifier`);
+      }
+      if (ids.securityGroupId) {
+        problems.push(`plan resource "${entry.id}" records a securityGroupId — Aurora DSQL is regional and serverless and has no security group to adopt`);
+      }
+      if (m.analysis?.egress?.classification?.value === 'none' && !ids.vpcEndpointServiceName) {
+        problems.push(`plan resource "${entry.id}" is adopted and egress.classification is "none", but records no vpcEndpointServiceName — the certificate DSQL presents on the public endpoint does not cover the VPC-endpoint hostname, so the data-plane service name has to be resolved and recorded, not assumed`);
+      }
+    }
+    return problems;
+  },
+
+  function isolatedDsqlDatastoreHasDataPlaneEndpoint(m) {
+    if (m.analysis?.egress?.classification?.value !== 'none') return [];
+    const hasDsql = (m.analysis?.datastores ?? []).some((store) => {
+      if (!IAM_AUTH_KINDS.has(store.kind)) return false;
+      const entry = datastoreEntry(m, store);
+      return entry && entry.action !== 'skip';
+    });
+    if (!hasDsql) return [];
+
+    if (!(m.analysis.egress.awsServices ?? []).includes('dsql-data')) {
+      return ['egress.classification is "none" and a dsql datastore is in the plan, but egress.awsServices omits "dsql-data" — connecting to DSQL from isolated subnets needs the data-plane interface endpoint, not the "dsql" control-plane one, which is not required to connect at all'];
+    }
+    return [];
   },
 
   function endpointSetCoversCreatedDatastores(m) {

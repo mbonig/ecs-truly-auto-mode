@@ -90,6 +90,41 @@ Fargate cannot pull the image or ship logs without them.
 | `kms` | `com.amazonaws.<region>.kms` | Encrypted secrets |
 | `sts` | `com.amazonaws.<region>.sts` | Role assumption |
 | `events` | `com.amazonaws.<region>.events` | EventBridge |
+| `dsql-data` | `com.amazonaws.<region>.dsql-<suffix>` (**discovered**, see below) | Aurora DSQL connections |
+| `dsql` | `com.amazonaws.<region>.dsql` | DSQL **control plane** only — not needed to connect |
+
+**Aurora DSQL has an interface endpoint, and using it is not automatic.** A DSQL
+connection is a PostgreSQL wire-protocol call over TCP, not an SDK call, so it is easy
+to reason that it has no VPC endpoint at all — that reasoning is wrong, and confirmed
+wrong against `aws ec2 describe-vpc-endpoint-services`, not against a design document
+or a prose claim. `boto3.client("dsql")` is present in the code because token
+generation needs the client, but generating a token (`generate_db_connect_auth_token`)
+is local SigV4 signing that makes **no network call** — so recording `dsql` (the
+control plane) instead of `dsql-data` provisions an endpoint that is never used and
+never lets the actual connection through. Only `dsql-data` is needed to connect.
+
+The `dsql-data` service name is region-specific and opaque
+(`com.amazonaws.us-east-1.dsql-fnh4` was the observed form) and must never be
+hardcoded — a literal suffix from one region synthesizes a stack that deploys there
+and fails everywhere else. Resolve it one of two ways:
+
+- **The stack creates the cluster:** read it off the cluster's own
+  `VpcEndpointServiceName` attribute at synth time. No lookup, no credentials, no
+  region-specific constant.
+- **The stack adopts a cluster:** a plan-time lookup, recorded into the manifest like
+  any other adopted identifier —
+  `aws ec2 describe-vpc-endpoint-services --filters Name=service-name,Values=*dsql*
+  --query 'ServiceDetails[?contains(ServiceName,\`dsql-\`)].ServiceName'` — and
+  carried through `adopt-validation.md`'s `validated: true/false` treatment.
+
+**The hostname the task connects to depends on the egress classification, and this
+coupling has no forgiving failure mode.** DSQL's public endpoint
+(`<id>.dsql.<region>.on.aws`) and its VPC-endpoint form
+(`<id>.dsql-<suffix>.<region>.on.aws`) are different strings, and the server
+certificate is cut for whichever one is actually correct. A driver using
+`sslmode=verify-full` against the wrong one for the chosen egress mode does not fail
+fast — it hangs until the connect timeout. Get the endpoint from the same place the
+classification came from, not from a value typed once and reused.
 
 Three things about this table that cause real failures:
 

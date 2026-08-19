@@ -56,6 +56,36 @@ By **shape** — a connection URL that embeds credentials
 public URLs, bucket **names** (a name is not a credential), and non-sensitive
 hostnames.
 
+A CA bundle **path** is plaintext configuration, not a secret, even when it exists
+only to make a database connection succeed. It names a file already present in the
+image, not a credential — see the libpq trust-path note below.
+
+### Not a secret at all: IAM-authenticated datastores
+
+An IAM-authenticated network datastore (Aurora DSQL; RDS/Aurora with IAM database
+authentication — see [datastores.md](./datastores.md)) has **no password anywhere in
+the system**. The driver authenticates with a short-lived SigV4 token signed by the
+task role, so there is no `config.secrets` entry to record for it — recording one is
+a bug, not a cautious extra. The endpoint hostname it connects to is plaintext
+configuration, exactly like a bucket name, and belongs in `config.environment` (or,
+when the platform stack resolves it at deploy time, injected the same way a
+platform-published SSM value normally is).
+
+A libpq-based driver (`psycopg`, `psycopg2`, `ruby-pg`, `pdo_pgsql`, `psql`) connecting
+with `sslmode=verify-full` from a slim or minimal base image is a case worth flagging
+regardless of which datastore it is: libpq's default `sslrootcert`
+(`~/.postgresql/root.crt`) does not exist in most container images, and its `system`
+mode resolves through OpenSSL's hashed-symlink directory, which slim images typically
+omit even though the underlying CA bundle is present and correct. The practical
+result is a connection that fails outright, or — worse — an application that catches
+the error and reports healthy anyway, which an ALB health check cannot see through.
+For a Debian/Ubuntu-based image, recommend the explicit path
+`/etc/ssl/certs/ca-certificates.crt` as plaintext `config.environment`, using the
+variable name the application code already reads — never invent one. Alpine,
+distroless, and RHEL-family paths differ and have not been verified; say so rather
+than guessing. Clients that are not libpq-based (Node `pg`, Go `pgx`) use their
+runtime's own TLS stack and need no such variable.
+
 ### Neither, and worth catching
 
 **AWS credentials** — `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,

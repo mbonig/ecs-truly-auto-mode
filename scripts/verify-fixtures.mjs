@@ -468,6 +468,117 @@ console.log('\ncreated-datastores — a create decision reaches the generated st
   );
 }
 
+console.log('\ndsql-created — Aurora DSQL is created, isolated egress:\n');
+{
+  const path = join(repo, 'examples', 'manifests', 'dsql-created.manifest.yaml');
+  const m = parseYaml(readFileSync(path, 'utf8'));
+  check('dsql-cluster is created', planEntry(m, 'dsql-cluster').action === 'create');
+  check('egress stays none', m.analysis.egress.classification.value === 'none');
+  check('dsql-data is required to connect', m.analysis.egress.awsServices.includes('dsql-data'));
+
+  const { platform, service } = synthManifest(path);
+  const p = typesOf(platform);
+  const resources = Object.values(platform.Resources);
+
+  check('one DSQL cluster is synthesized', p['AWS::DSQL::Cluster'] === 1, `got ${p['AWS::DSQL::Cluster']}`);
+
+  const cluster = resources.find((r) => r.Type === 'AWS::DSQL::Cluster');
+  check('deletion protection is enabled', cluster?.Properties?.DeletionProtectionEnabled === true);
+  check(
+    'the cluster is retained, not deleted, with the stack',
+    cluster?.DeletionPolicy === 'Retain' && cluster?.UpdateReplacePolicy === 'Retain',
+    JSON.stringify({ DeletionPolicy: cluster?.DeletionPolicy, UpdateReplacePolicy: cluster?.UpdateReplacePolicy }),
+  );
+
+  check(
+    "a data-plane interface endpoint reads the cluster's own VpcEndpointServiceName attribute",
+    resources.some(
+      (r) =>
+        r.Type === 'AWS::EC2::VPCEndpoint' &&
+        r.Properties?.ServiceName?.['Fn::GetAtt']?.[1] === 'VpcEndpointServiceName',
+    ),
+    'no endpoint referenced the cluster attribute — a hardcoded suffix would break outside one region',
+  );
+
+  check(
+    'no DSQL control-plane endpoint is synthesized',
+    !resources.some((r) => r.Type === 'AWS::EC2::VPCEndpoint' && r.Properties?.ServiceName === 'com.amazonaws.us-east-1.dsql'),
+    'connecting never calls the control plane — provisioning it anyway is a standing cost for nothing',
+  );
+
+  const taskRoleStatements = resources
+    .filter((r) => r.Type === 'AWS::IAM::Policy' && JSON.stringify(r).includes('DsqlClusterAccess'))
+    .flatMap((r) => r.Properties.PolicyDocument.Statement);
+  check(
+    'the task role is granted dsql:DbConnect, scoped to the cluster ARN',
+    taskRoleStatements.some((s) => s.Sid === 'DsqlClusterAccess' && s.Action === 'dsql:DbConnect'),
+    JSON.stringify(taskRoleStatements),
+  );
+
+  check(
+    'no security group rule is generated for the cluster — DSQL has none to adopt',
+    !JSON.stringify(platform).includes('DsqlCluster tasks to'),
+  );
+
+  const prefix = m.target.ssmPrefix;
+  const published = resources
+    .filter((r) => r.Type === 'AWS::SSM::Parameter')
+    .map((r) => r.Properties.Name);
+  check('the platform stack publishes dsql-cluster-endpoint', published.includes(`${prefix}/dsql-cluster-endpoint`));
+
+  const serviceEnv = Object.values(service.Resources)
+    .find((r) => r.Type === 'AWS::ECS::TaskDefinition')
+    ?.Properties?.ContainerDefinitions?.[0]?.Environment ?? [];
+  check(
+    'the endpoint env var is injected by reference to the platform-published SSM parameter, not a literal',
+    serviceEnv.some((e) => e.Name === 'DSQL_CLUSTER_ENDPOINT' && e.Value?.Ref),
+    JSON.stringify(serviceEnv),
+  );
+}
+
+console.log('\ndsql-adopted — an existing cluster, isolated egress:\n');
+{
+  const path = join(repo, 'examples', 'manifests', 'dsql-adopted.manifest.yaml');
+  const m = parseYaml(readFileSync(path, 'utf8'));
+  const entry = planEntry(m, 'dsql-cluster');
+  check('dsql-cluster is adopted', entry.action === 'adopt');
+  check('no securityGroupId is recorded — DSQL has none', !entry.identifiers.securityGroupId);
+  check(
+    'a vpcEndpointServiceName is recorded because egress is none',
+    !!entry.identifiers.vpcEndpointServiceName,
+  );
+
+  const { platform } = synthManifest(path);
+  const p = typesOf(platform);
+  const resources = Object.values(platform.Resources);
+
+  check('no DSQL cluster is synthesized', !p['AWS::DSQL::Cluster'], `found ${p['AWS::DSQL::Cluster']}`);
+
+  check(
+    'the interface endpoint uses the recorded service name verbatim',
+    resources.some(
+      (r) => r.Type === 'AWS::EC2::VPCEndpoint' && r.Properties?.ServiceName === entry.identifiers.vpcEndpointServiceName,
+    ),
+  );
+
+  check(
+    'the endpoint is a literal in the service template, not an SSM lookup',
+    JSON.stringify(
+      Object.values(platform.Resources).filter((r) => r.Type === 'AWS::SSM::Parameter').map((r) => r.Properties.Name),
+    ).includes('dsql-cluster-endpoint') === false,
+    'an adopted endpoint is known at plan time — publishing it would mean the analysis recorded it twice',
+  );
+
+  const taskRoleStatements = resources
+    .filter((r) => r.Type === 'AWS::IAM::Policy' && JSON.stringify(r).includes('DsqlClusterAccess'))
+    .flatMap((r) => r.Properties.PolicyDocument.Statement);
+  check(
+    'admin dbUser grants dsql:DbConnectAdmin, not dsql:DbConnect',
+    taskRoleStatements.some((s) => s.Sid === 'DsqlClusterAccess' && s.Action === 'dsql:DbConnectAdmin'),
+    JSON.stringify(taskRoleStatements),
+  );
+}
+
 rmSync(join(cdkDir, 'lib', 'app-config.ts'), { force: true });
 rmSync(join(cdkDir, 'cdk.out'), { recursive: true, force: true });
 

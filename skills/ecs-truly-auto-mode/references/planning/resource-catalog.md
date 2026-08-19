@@ -220,6 +220,47 @@ over TLS, so enabling it silently would break a client that connects in plaintex
 This is the one datastore built from L1 constructs — aws-cdk-lib ships no L2 for
 ElastiCache — which is worth knowing when reading the generated stack.
 
+### `dsql-cluster`
+
+**Included:** when an Aurora DSQL datastore is detected.
+**Adopt identifiers:** `clusterIdentifier`, `endpoint`, and — only when
+`egress.classification` is `none` — `vpcEndpointServiceName`, from the lookup in
+[egress.md](../analysis/egress.md#aws-services-to-vpc-endpoints).
+**Create parameters:** none are asked. DSQL is serverless with no capacity or version
+to choose, which is what makes offering `create` here defensible in the first place —
+provisioning takes about 30 seconds, not the tens of minutes RDS or DocumentDB take.
+
+**Deliberately excludes `securityGroupId`.** DSQL has no security group — it is
+regional and serverless, with no ENI in any VPC — so the standing advice above that a
+missing ingress rule is the piece most often missed does not apply here. Following it
+into looking for a group to adopt or create is a dead end.
+
+**No credentials, in either direction.** DSQL has no generated secret and no adopted
+one: the driver authenticates with a short-lived SigV4 token signed by the task role.
+The endpoint is plaintext configuration, not a secret, and it is handled the same way
+a created ElastiCache endpoint is — on the adopt path it is a literal already known at
+plan time (`analysis.config.environment`); on the create path it is a deploy-time
+value published from the platform stack. Record the environment variable in
+`analysis.datastores[].endpointEnvVar` either way; without it a created cluster exists
+and the container has no way to address it.
+
+**The IAM grant is necessary but not sufficient — say so in the plan.** `task-role`
+carries `dsql:DbConnect` (or `dsql:DbConnectAdmin`) on the cluster ARN, but that only
+authorises the *connection attempt*. DSQL still requires a database role linked to
+that IAM principal from inside the cluster, with SQL run against it directly:
+
+```sql
+-- CREATE ROLE is not idempotent — guard with a lookup, never assume a fresh cluster
+SELECT count(*) FROM pg_roles WHERE rolname = '<dbUser>';
+CREATE ROLE <dbUser> WITH LOGIN;
+AWS IAM GRANT <dbUser> TO '<task-role-arn>';
+```
+
+This is manual work the plan must name explicitly as something the user still has to
+do after the platform stack deploys — the task role's ARN is only known once it
+exists, so it cannot run as part of `cdk deploy`, and skipping this step is what
+produces a working IAM policy and a connection that still fails.
+
 ### Bucket, table, queue, topic entries
 
 **Included:** one entry per API-reached resource detected.

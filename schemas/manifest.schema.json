@@ -97,7 +97,8 @@
               "items": {
                 "enum": [
                   "ecr", "ecr-docker", "logs", "secretsmanager", "ssm",
-                  "s3", "dynamodb", "sqs", "sns", "kms", "sts", "events"
+                  "s3", "dynamodb", "sqs", "sns", "kms", "sts", "events",
+                  "dsql-data", "dsql"
                 ]
               },
               "uniqueItems": true
@@ -121,14 +122,23 @@
             "additionalProperties": false,
             "properties": {
               "kind": {
-                "description": "Every kind the analysis can name, plus 'other'. A kind absent from this list cannot be recorded at all, which drops the datastore from the plan silently — which is why 'documentdb', 'sqs' and 'sns' are here even though only the create path is new: config.ts and generate-config.mjs have always handled them.",
-                "enum": ["rds", "dynamodb", "elasticache", "documentdb", "s3", "sqs", "sns", "other"]
+                "description": "Every kind the analysis can name, plus 'other'. A kind absent from this list cannot be recorded at all, which drops the datastore from the plan silently — which is why 'documentdb', 'sqs' and 'sns' are here even though only the create path is new: config.ts and generate-config.mjs have always handled them. 'dsql' is Aurora DSQL — IAM-authenticated, reached over TCP like a database, with no security group and no password.",
+                "enum": ["rds", "dynamodb", "elasticache", "documentdb", "s3", "sqs", "sns", "dsql", "other"]
               },
               "engine": { "type": "string" },
               "evidence": { "$ref": "#/definitions/evidenceList" },
               "confidence": { "$ref": "#/definitions/confidence" },
               "confirmedByUser": { "type": "boolean" },
               "iamActions": { "type": "array", "items": { "type": "string" } },
+              "dbUser": {
+                "description": "The database role the application logs in as, for kind 'dsql'. 'admin' needs dsql:DbConnectAdmin; any other name needs dsql:DbConnect. Absent defaults to 'admin'.",
+                "type": "string"
+              },
+              "endpointEnvVar": {
+                "description": "The environment variable the container reads the cluster endpoint from, for kind 'dsql'. Learned from the code that reads it, never invented. There is no 'connection' block for this kind — DSQL has no secret to decompose into fields, so the endpoint is either a literal in analysis.config.environment (adopted, known at plan time) or published from SSM (created).",
+                "type": "string",
+                "minLength": 1
+              },
               "planId": {
                 "description": "The id of this datastore's entry in plan.resources. Explicit rather than derived: the network-reached kinds map onto fixed ids, but an API-reached entry's id names its role ('receipts-bucket', 'sessions-table'), and two buckets are indistinguishable without this. Before created datastores existed the projection could infer the link from an adopted entry's identifiers — a created entry has none, so the link has to be recorded.",
                 "type": "string",
