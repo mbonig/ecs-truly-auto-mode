@@ -133,21 +133,6 @@ aws route53 get-hosted-zone --id <hostedZoneId>
 No `--region` — Route 53 is global. Confirm the recorded hostname is within the zone,
 and that the zone is public if the hostname is meant to be.
 
-### RDS instance
-
-```bash
-aws rds describe-db-instances --db-instance-identifier <id> --region <region>
-```
-
-Record `Endpoint.Address` and `Endpoint.Port` from the response rather than trusting
-what was typed. Confirm the instance's VPC matches, and capture its security group —
-the generated stack adds an ingress rule to it from the task security group, and that
-rule is the piece most often missed.
-
-If `MasterUserSecret` is present, the instance has managed credentials with rotation.
-Point the secret entry at that ARN rather than creating a parallel secret that goes
-stale after the first rotation.
-
 ### Secrets Manager and SSM
 
 ```bash
@@ -160,6 +145,83 @@ it would leak it into context. If a `jsonKey` was recorded, it cannot be verifie
 without reading the value — leave it unverified and say so. That is the correct
 trade.
 
+## Datastores: discovery, then the decision
+
+Datastore lookups do the same job the [GitHub OIDC provider](#github-oidc-provider)
+lookup does — they *decide* `create` versus `adopt` rather than confirming a value the
+user typed. So run them **before asking anything** about the entry.
+
+The procedure is the same for every kind:
+
+| Outcome | Record |
+| --- | --- |
+| The lookup matched | `adopt`, identifiers filled in from the response, `validated: true` — do not ask |
+| The lookup succeeded and matched nothing | offer `create`, `validated: true` |
+| The lookup could not run | **ask**, offering both actions, `validated: false` |
+| `nameFound: false` — nothing to look up | **ask**, offering both actions |
+
+Two rules make this safe, and both are worth stating because getting either wrong is
+expensive:
+
+**A lookup that could not run is not evidence of absence.** No credentials, an expired
+session, or a denied `describe` all look identical to "there is no table" from the
+outside, and the two call for opposite actions. Only a call that *succeeded* and came
+back empty means the resource is not there.
+
+**One lookup per recorded name — never an enumeration.** Look up the name the analysis
+found. Do not list every RDS instance or table in the account and present a picker: an
+account can hold hundreds, a `describe` on a known name needs a far narrower permission
+than a `List*`, and the evidence-backed match is a better answer than a menu. When
+`nameFound` is `false` there is nothing to look up, so ask — do not enumerate to fill the
+gap.
+
+Where the name comes from, per kind: the first label of an `*.rds.amazonaws.com` or
+`*.cache.amazonaws.com` host, a table or bucket name literal, a queue or topic name in
+configuration.
+
+### RDS instance
+
+```bash
+aws rds describe-db-instances --db-instance-identifier <id> --region <region>
+```
+
+On a match, record `Endpoint.Address` and `Endpoint.Port` from the response rather than
+trusting what was typed. Confirm the instance's VPC matches, and capture its security
+group — the generated stack adds an ingress rule to it from the task security group, and
+that rule is the piece most often missed.
+
+If `MasterUserSecret` is present, the instance has managed credentials with rotation.
+Point the secret entry at that ARN rather than creating a parallel secret that goes
+stale after the first rotation.
+
+On no match, `create` is available — with two things to say in the plan, because both
+are surprising if unsaid: the instance is **retained and deletion-protected**, so a stack
+deletion leaves it (and its bill) behind; and the **first platform deploy blocks for tens
+of minutes** while RDS provisions, which reads as a hang otherwise.
+
+An `aurora-*` engine is adopt-only regardless of what the lookup found — a cluster's
+writer/reader topology is not derivable from application code.
+
+### ElastiCache cluster
+
+```bash
+aws elasticache describe-replication-groups --replication-group-id <id> --region <region>
+aws elasticache describe-cache-clusters --cache-cluster-id <id> --region <region>
+```
+
+Replication groups for Redis, cache clusters for Memcached. Record the primary endpoint
+(or the configuration endpoint for Memcached), the port, and the security group.
+
+### DocumentDB cluster
+
+```bash
+aws docdb describe-db-clusters --db-cluster-identifier <id> --region <region>
+```
+
+Record the cluster endpoint, port and security group. A `mongodb+srv://` URI is not a
+DocumentDB cluster and there is nothing to look up — it is an external service, and the
+question it raises is the egress classification.
+
 ### S3 bucket
 
 ```bash
@@ -168,7 +230,9 @@ aws s3api head-bucket --bucket <name> --region <region>
 
 `404` means it does not exist; `403` means it exists but belongs to someone else —
 a meaningful difference, since bucket names are globally unique and a typo can land
-on a stranger's bucket.
+on a stranger's bucket. **`403` is not a create signal.** A bucket that exists under
+someone else's account will fail the create with `BucketAlreadyExists`, so treat it as a
+name to change rather than a resource to make.
 
 ### DynamoDB table
 
@@ -176,8 +240,26 @@ on a stranger's bucket.
 aws dynamodb describe-table --table-name <name> --region <region>
 ```
 
-Record the table ARN, and the index ARNs if the code queries indexes — index access
-needs `<table-arn>/index/*` in addition to the table itself.
+On a match, record the table ARN, and the index ARNs if the code queries indexes — index
+access needs `<table-arn>/index/*` in addition to the table itself.
+
+On no match, `create` requires a **key schema at `high` confidence or confirmed by the
+user**. There is no default. A table's key schema is immutable, so a wrong partition key
+is fixed by deleting and rebuilding a table that may by then hold data — this is the one
+datastore decision that cannot be corrected after the fact, so it is the one place the
+plan refuses to complete on a shape the user has not looked at.
+
+### SQS queue and SNS topic
+
+```bash
+aws sqs get-queue-url --queue-name <name> --region <region>
+aws sns get-topic-attributes --topic-arn <arn> --region <region>
+```
+
+For SQS, record the queue URL and derive the ARN from it. A `NonExistentQueue` error is
+the "matched nothing" outcome, not a failure to report.
+
+## Pipeline and bootstrap checks
 
 ### CDK bootstrap qualifier
 

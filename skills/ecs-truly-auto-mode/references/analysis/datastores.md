@@ -51,12 +51,55 @@ secret. Signals are an `AWSAuthenticationPlugin` config, a `rds.iam` connection
 option, or a token-generation call. Do not assume it — it is uncommon, and assuming
 it wrongly produces an app that cannot authenticate.
 
-**Adoption:** the skill does not create databases. A database is a stateful resource
-with a lifecycle far longer than a service, and creating one as a side effect of
-deploying an app is the wrong default. Collect `dbInstanceIdentifier`,
-`endpointAddress`, `port`, and `securityGroupId`, and wire connectivity to it. If the
-user has no database yet, say that it needs to exist first and stop asking for it —
-do not offer to create one.
+**Adopting:** collect `dbInstanceIdentifier`, `endpointAddress`, `port`, and
+`securityGroupId`, and wire connectivity to it. Planning looks for one in the account
+first, keyed on whatever name was found — see
+[adopt-validation](../planning/adopt-validation.md#rds-instance).
+
+**Creating:** record `engine` and the [connection style](#connection-variables) below.
+The instance class, engine version, allocated storage and multi-AZ setting are *asked*
+during planning rather than recorded here, because they carry a standing monthly cost
+and no static analysis can infer them.
+
+A created database is retained on stack deletion and deletion-protected, and its first
+deploy blocks for tens of minutes. Say both when presenting the plan — the second reads
+as a hang otherwise.
+
+Two things a created database is **not**: migrated, or Aurora. It comes up empty, so an
+app with a `migrations/` directory still needs a migration step that this skill does not
+generate — say so at completion. And an `aurora-*` engine is adopt-only: a cluster's
+writer/reader topology is not derivable from application code, and creating a
+single-instance cluster misrepresents what Aurora is for.
+
+### Connection variables
+
+For every network-reached datastore, record the environment variables the application
+reads to reach it, and **which of two shapes they are**:
+
+- **`fields`** — discrete variables: `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`,
+  `DB_NAME`. Map each onto the secret field that supplies it.
+- **`url`** — one variable holding an assembled connection string: `DATABASE_URL`,
+  `REDIS_URL`, `MONGO_URI`.
+
+This distinction decides whether a *created* database is usable at all, which is why it
+is recorded rather than left implicit.
+
+A created database's credentials are generated, and a generated secret holds `host`,
+`port`, `username`, `password` and `dbname`. It does not hold an assembled URL, and
+nothing can compose one without reading the password to build it. So:
+
+| Style | Created | Adopted |
+| --- | --- | --- |
+| `fields` | each variable injected from its secret field | from the recorded secret |
+| `url` | **plan is incomplete** — see below | from the recorded secret |
+
+For `create` plus `url`, say exactly that and offer the two resolutions: supply an
+existing secret holding the URL — the database is still created, and the secret is
+injected by reference like any other — or switch to the discrete variables and adapt the
+application. Do not inject five fields an application that reads one will never look at,
+and do not quietly fall back to adopting. `DATABASE_URL` is the common case, not an edge
+one, so this comes up on most first runs and is worth stating plainly rather than
+apologetically.
 
 ### ElastiCache (Redis / Memcached)
 
@@ -65,6 +108,13 @@ Sidekiq, Celery, and BullMQ all require Redis.
 
 **Implies:** a security group rule on 6379 (Redis) or 11211 (Memcached), a secret if
 auth is enabled, and `iamActions: []`.
+
+**Creating:** the node type and, for Redis, the replica count are asked. ElastiCache has
+no generated secret, so the endpoint and port are published as parameters and the
+application's host and port variables are injected from those. In-transit encryption is
+deliberately left off: it requires the client to connect over TLS, so enabling it
+silently would break an application that connects in plaintext. At-rest encryption is on,
+because it is transparent to the client.
 
 A queue library is worth flagging beyond the datastore itself: Sidekiq, Celery, and
 BullMQ imply a **worker process** separate from the web process — a second task
@@ -79,6 +129,13 @@ from the user rather than a silent omission.
 differ in wire-protocol compatibility, and `mongodb+srv://` URIs (Atlas) mean an
 **external** service, which forces `public` egress. This is a case where guessing
 wrong changes both the egress classification and the resource plan.
+
+**Creating:** only DocumentDB. The instance class and instance count are asked; the
+cluster is retained and deletion-protected like a relational database, and generates its
+own credentials secret the same way. A `mongodb+srv://` URI is not a datastore to create
+at all — it is an external service, and the answer there is the egress classification.
+Note that a Mongo connection string is almost always `url`-shaped, so the
+[connection-variable](#connection-variables) rule usually applies.
 
 ## API-reached datastores
 
@@ -97,6 +154,29 @@ constants.
 - A **gateway** VPC endpoint in isolated subnets — free, no ENI.
 - No security group rule.
 
+**Creating** needs the **key schema**, and this is the one place in the datastore work
+where a wrong answer cannot be corrected later: a table's key schema is immutable. Fixing
+it means deleting and rebuilding a table that may by then hold data.
+
+So record the partition key, its type, any sort key, and only the indexes the code was
+actually found to query — an unqueried index is a standing write cost. Then:
+
+- Key schema at `high` confidence → `create` is available.
+- Anything less → **ask.** There is no default, at any confidence level. Planning
+  rejects a `create` decision on an unconfirmed key schema rather than guessing.
+
+`GetItem({ Key: { pk: ..., sk: ... } })` and `Query({ KeyConditionExpression: ... })` are
+the reliable signals. A table accessed only through a helper that builds keys dynamically
+usually cannot be read at all — say so and ask.
+
+Billing mode and point-in-time recovery are not asked: on-demand is the only honest
+default when no capacity figure is derivable from static analysis, and the alternative to
+PITR is silent, unrecoverable data loss. Say what was chosen; do not ask.
+
+Also record the environment variable carrying the table name. For a *created* table that
+name is a deploy-time value, so it is published as a parameter and injected — without the
+variable recorded, the table gets created and the container has no way to address it.
+
 ### S3
 
 **Signals:** an S3 SDK client, a bucket name in config, presigned-URL generation.
@@ -105,6 +185,11 @@ constants.
 `arn:aws:s3:::<bucket>/*`, and `s3:ListBucket` on `arn:aws:s3:::<bucket>` — a
 different resource ARN, which is a routine source of confusing access-denied errors.
 Plus a **gateway** endpoint, which is required anyway for ECR image layers.
+
+**Creating** asks nothing. A bucket has no cost knob worth a question, so the shape is
+fixed and stated: SSE-S3 encryption, all public access blocked, TLS enforced, versioning
+on, retained on stack deletion. Record the environment variable holding the bucket name,
+as for a table.
 
 ### SQS / SNS / EventBridge
 
@@ -117,12 +202,33 @@ Interface endpoints in isolated subnets.
 An SQS **consumer** is another worker-process signal — a long-polling receive loop is
 usually not the web process. Same treatment as Sidekiq: flag it and ask.
 
+**Creating** asks nothing here either. A queue gets a dead-letter queue at 5 receives,
+because a queue without one silently discards what it cannot process; a topic gets
+nothing but a name. Both are retained. Record the variable holding the queue URL or the
+topic ARN — a created queue's URL is a deploy-time value.
+
 ## Recording
+
+Every datastore records a **`planId`** naming its entry in `plan.resources`, and a
+**`nameFound`** flag. Both exist for planning rather than for analysis:
+
+- `planId` is the link to the create-or-adopt decision. The network-reached kinds map
+  onto fixed ids (`database`, `cache`), but an API-reached entry's id names its role —
+  `receipts-bucket`, `sessions-table` — and two buckets are indistinguishable without
+  it. An adopted entry could once be matched by its identifiers; a created one has none.
+- `nameFound` says whether a name exists to look up in the account. `true` means
+  planning runs one targeted lookup; `false` means there is nothing to look up, so
+  planning asks instead of enumerating the account. **These are different branches**,
+  so record which one applies rather than leaving it inferred from an absent field.
+
+A network-reached datastore:
 
 ```yaml
 datastores:
   - kind: rds
     engine: postgres
+    planId: database
+    nameFound: false        # nothing but DATABASE_URL — no instance name to look up
     confidence: high
     evidence:
       - file: app/db.py
@@ -131,7 +237,47 @@ datastores:
       - file: alembic.ini
         excerpt: 'alembic migration config present'
     iamActions: []
+    connection:
+      style:
+        value: url          # a generated secret cannot serve this — see above
+        confidence: high
+        evidence:
+          - file: app/db.py
+            line: 6
+      variables:
+        - name: DATABASE_URL
 ```
+
+An API-reached datastore that could be created:
+
+```yaml
+  - kind: dynamodb
+    planId: sessions-table
+    nameFound: true
+    confidence: high
+    evidence:
+      - file: app/sessions.py
+        line: 11
+        excerpt: 'GetItem/PutItem on SESSIONS_TABLE'
+    iamActions:
+      - dynamodb:GetItem
+      - dynamodb:PutItem
+    schema:               # required before `create` — the key schema is immutable
+      partitionKey:
+        value: { name: sessionId, type: string }
+        confidence: high
+        evidence:
+          - file: app/sessions.py
+            line: 14
+            excerpt: 'Key: { sessionId: { S: sessionId } }'
+    attributeVariables:
+      - name: SESSIONS_TABLE
+        attribute: tableName
+```
+
+The `schema`, `connection` and `attributeVariables` fields carry evidence and a
+confidence level like every other finding, and record **names and fields only**. There is
+no property anywhere in them that could hold a credential value.
 
 ## Presenting
 
@@ -146,3 +292,10 @@ an internal API the analysis didn't recognize looks exactly like a stateless app
 **Never grant wildcard permissions** to cover uncertainty. `dynamodb:*` on `*` makes
 the uncertainty permanent and invisible. If the tables cannot be determined, say so
 and ask — the plan is the right place to resolve it.
+
+**Do not steer the user toward adopting.** Both actions are real now, and a datastore the
+account does not have is a normal answer rather than a blocked run. Present what the
+account lookup found, say what creating would build and what it would cost — retained on
+delete, tens of minutes on the first deploy for a database — and let the user choose.
+Kind `other` is the one exception: the skill cannot create a resource it could not
+identify, so that entry is adopt-only and should say why.

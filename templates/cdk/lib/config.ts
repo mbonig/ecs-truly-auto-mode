@@ -70,22 +70,162 @@ export interface PublicHostname {
   readonly zoneName: string;
 }
 
-/** A network-reached datastore: needs a security group rule, not IAM. */
-export interface NetworkDatastore {
-  readonly id: string;
-  readonly kind: 'rds' | 'elasticache' | 'documentdb';
-  readonly securityGroupId: string;
-  readonly port: number;
-  readonly endpointAddress: string;
+/**
+ * A network-reached datastore: needs a security group rule, not IAM.
+ *
+ * Created and adopted are genuinely different shapes rather than one shape with
+ * optional fields. An adopted store is an endpoint and a security group that belong
+ * to someone else; a created one is an instance this stack owns, whose endpoint does
+ * not exist until it is deployed. Collapsing the two into optional fields is how a
+ * `create` decision ends up producing nothing at all.
+ *
+ * Everything created here is retained on stack deletion, and databases also carry
+ * deletion protection. The asymmetry is the whole reason: a retained instance costs
+ * money and can be deleted by hand in a minute, while a destroyed one is gone.
+ */
+export type NetworkDatastore = { readonly id: string } & (
+  | {
+      readonly mode: 'adopt';
+      readonly kind: 'rds' | 'elasticache' | 'documentdb';
+      readonly securityGroupId: string;
+      readonly port: number;
+      readonly endpointAddress: string;
+    }
+  | ({ readonly mode: 'create' } & CreatedNetworkDatastore)
+);
+
+/**
+ * A network-reached datastore this stack builds.
+ *
+ * The parameters here are the ones that carry a standing monthly cost or a durability
+ * consequence, which is why they are recorded from an explicit question rather than
+ * defaulted — see references/planning/resource-catalog.md.
+ */
+export type CreatedNetworkDatastore = {
+  /**
+   * SSM parameter suffixes the platform stack publishes this datastore's endpoint and
+   * port under.
+   *
+   * The suffixes are carried in the config rather than derived independently on both
+   * sides, because the publisher and the reader agreeing on a name is the entire
+   * contract: derive it twice and a rename in one place produces a container reading a
+   * parameter nobody wrote, which fails at task start with nothing pointing at the cause.
+   */
+  readonly endpointParameter: string;
+  readonly portParameter: string;
+} & (
+  | {
+      readonly kind: 'rds';
+      /** Postgres, MySQL, MariaDB, SQL Server or Oracle. Aurora is adopt-only: a cluster's writer/reader topology is not derivable from application code. */
+      readonly engine: 'postgres' | 'mysql' | 'mariadb' | 'sqlserver' | 'oracle';
+      readonly engineVersion: string;
+      readonly instanceClass: string;
+      readonly allocatedStorageGb: number;
+      readonly multiAz: boolean;
+      readonly port: number;
+      /**
+       * Where the container reads this database's credentials from.
+       *
+       * A created database's credentials are generated, so they cannot be named in the
+       * plan — the stack makes the secret and the service stack injects its fields.
+       */
+      readonly credentials: DatabaseCredentials;
+    }
+  | {
+      readonly kind: 'elasticache';
+      readonly engine: 'redis' | 'memcached';
+      readonly nodeType: string;
+      /** Redis only. Memcached scales by node count instead. */
+      readonly replicaCount?: number;
+      readonly port: number;
+    }
+  | {
+      readonly kind: 'documentdb';
+      readonly instanceClass: string;
+      readonly instanceCount: number;
+      readonly port: number;
+      readonly credentials: DatabaseCredentials;
+    }
+);
+
+/**
+ * How a created database's generated credentials reach the container.
+ *
+ * `fields` maps each environment variable the application reads onto a field of the
+ * generated secret, injected through the execution role.
+ *
+ * There is deliberately no `url` variant. A generated secret holds host, port,
+ * username, password and dbname; it does not hold an assembled connection URL, and
+ * composing one would mean something reading the password to build it. An application
+ * that reads a single `DATABASE_URL` is served by an *adopted* secret — recorded in
+ * `AppConfig.secrets` like any other — while the database itself is still created.
+ * Planning refuses to complete a plan that needs a URL this cannot supply, rather than
+ * generating five variables the application never looks at.
+ */
+export interface DatabaseCredentials {
+  /**
+   * SSM parameter suffix carrying the created secret's ARN. The ARN is a deploy-time
+   * value, so it travels through the platform → service contract like every other one.
+   */
+  readonly secretArnParameter: string;
+  /** Environment variable name → field of the secret that supplies it. */
+  readonly fields: Record<string, 'host' | 'port' | 'username' | 'password' | 'dbname'>;
 }
 
-/** An API-reached datastore: needs task-role permissions, not a security group rule. */
-export interface ApiDatastore {
-  readonly id: string;
-  readonly kind: 'dynamodb' | 's3' | 'sqs' | 'sns';
-  /** Exact resource ARNs. Never a wildcard — uncertainty belongs in the plan, not the policy. */
-  readonly resourceArns: string[];
-  readonly actions: string[];
+/**
+ * An API-reached datastore: needs task-role permissions, not a security group rule.
+ *
+ * The `actions` are shared by both modes — what the application does with the resource
+ * does not depend on who made it. What differs is where the ARN comes from: an adopted
+ * store names it outright, and a created one has no ARN until the stack is deployed,
+ * so the grant is written against the construct instead.
+ */
+export type ApiDatastore = { readonly id: string; readonly actions: string[] } & (
+  | {
+      readonly mode: 'adopt';
+      readonly kind: 'dynamodb' | 's3' | 'sqs' | 'sns';
+      /** Exact resource ARNs. Never a wildcard — uncertainty belongs in the plan, not the policy. */
+      readonly resourceArns: string[];
+    }
+  | ({ readonly mode: 'create' } & CreatedApiDatastore)
+);
+
+/** An API-reached datastore this stack builds. All are retained on stack deletion. */
+export type CreatedApiDatastore = {
+  /**
+   * SSM parameter suffix the platform stack publishes this resource's name under —
+   * its table name, bucket name, queue URL or topic ARN. Same reasoning as
+   * `CreatedNetworkDatastore.endpointParameter`: one recorded name, two users.
+   */
+  readonly attributeParameter: string;
+} & (
+  | {
+      readonly kind: 'dynamodb';
+      /**
+       * A table's key schema is immutable — a wrong partition key is fixed by deleting
+       * and rebuilding a table that may by then hold data, not by altering it. That is
+       * why planning refuses `create` on a table whose key schema is below high
+       * confidence and unconfirmed, and why there is no default for it here.
+       */
+      readonly partitionKey: TableAttribute;
+      readonly sortKey?: TableAttribute;
+      /** Only the indexes the code was found to query — an unqueried index is a standing write cost. */
+      readonly indexes?: TableIndex[];
+    }
+  | { readonly kind: 's3' }
+  | { readonly kind: 'sqs' }
+  | { readonly kind: 'sns' }
+);
+
+export interface TableAttribute {
+  readonly name: string;
+  readonly type: 'string' | 'number' | 'binary';
+}
+
+export interface TableIndex {
+  readonly name: string;
+  readonly partitionKey: TableAttribute;
+  readonly sortKey?: TableAttribute;
 }
 
 export interface SecretRef {
@@ -159,6 +299,22 @@ export interface AppConfig {
   readonly apiDatastores: ApiDatastore[];
 
   readonly environment: Record<string, string>;
+  /**
+   * Environment variables whose values are published SSM parameters rather than
+   * literals: variable name → parameter suffix under `ssmPrefix`.
+   *
+   * This exists because a created resource's physical id is a *deploy-time* value.
+   * A created table's name is not known when the service stack is synthesized, so
+   * `environment` — a `Record<string, string>` of literals — cannot carry it, and
+   * without somewhere to put it the table gets created and the container has no way
+   * to address it. The service stack resolves these the same way it already resolves
+   * the cluster name and the subnet ids.
+   *
+   * Created resources use this; adopted ones keep using `environment`, because their
+   * names were known at planning time. A name appearing in both is an error, not a
+   * precedence question.
+   */
+  readonly environmentFromSsm: Record<string, string>;
   readonly secrets: SecretRef[];
 }
 

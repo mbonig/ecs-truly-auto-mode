@@ -27,6 +27,27 @@ const API_KINDS = new Set(['dynamodb', 's3', 'sqs', 'sns']);
 const DEFAULT_PORTS = { rds: 5432, elasticache: 6379, documentdb: 27017 };
 const ENGINE_PORTS = { postgres: 5432, mysql: 3306, mariadb: 3306, sqlserver: 1433, oracle: 1521 };
 
+/** The identifier an adopted API-reached datastore has to name, for the error message. */
+const ADOPT_IDENTIFIER = {
+  s3: 'bucketName',
+  dynamodb: 'tableName',
+  sqs: 'queueName',
+  sns: 'topicArn',
+};
+
+/**
+ * The SSM parameter suffix a created API-reached resource's name is published under.
+ *
+ * Named after the attribute rather than the kind, because that is what the container is
+ * reading: a queue's URL and a topic's ARN are not interchangeable with a name.
+ */
+const ATTRIBUTE_PARAMETER = {
+  s3: 'bucket-name',
+  dynamodb: 'table-name',
+  sqs: 'queue-url',
+  sns: 'topic-arn',
+};
+
 function resource(manifest, id) {
   return (manifest.plan?.resources ?? []).find((r) => r.id === id);
 }
@@ -127,48 +148,267 @@ function buildPublicHostname(manifest) {
 }
 
 /**
- * Split datastores by how they are reached. Network-reached stores need a security
- * group rule and no IAM; API-reached stores need IAM and no security group rule.
- * Getting this backwards produces a policy that grants nothing while the real
- * missing piece goes unnoticed.
+ * Split datastores by how they are reached, and project each as created or adopted.
+ *
+ * Network-reached stores need a security group rule and no IAM; API-reached stores need
+ * IAM and no security group rule. Getting this backwards produces a policy that grants
+ * nothing while the real missing piece goes unnoticed.
+ *
+ * Every branch here that cannot produce a datastore calls `fail`. It used to `continue`,
+ * which is how a `create` decision came to produce an application with no table, no
+ * grant and no environment variable naming it — a silent success describing a different
+ * application. An incomplete entry stops generation instead.
  */
 function buildDatastores(manifest) {
   const networkDatastores = [];
   const apiDatastores = [];
+  const environmentFromSsm = {};
 
   for (const store of manifest.analysis?.datastores ?? []) {
-    if (NETWORK_KINDS.has(store.kind)) {
-      const entry = resource(manifest, store.kind === 'rds' ? 'database' : 'cache');
-      if (entry?.action !== 'adopt') continue;
-      const ids = entry.identifiers;
-      networkDatastores.push({
-        id: entry.id,
-        kind: store.kind,
-        securityGroupId: ids.securityGroupId,
-        port: ids.port ?? ENGINE_PORTS[store.engine] ?? DEFAULT_PORTS[store.kind],
-        endpointAddress: ids.endpointAddress,
-      });
+    if (store.kind === 'other') {
+      const entry = datastoreEntry(manifest, store);
+      if (entry?.action === 'create') {
+        fail(
+          `plan.resources: entry '${entry.id}' is marked create for a datastore of kind 'other'. ` +
+            'The skill cannot create a resource it was unable to identify — adopt it, or record a ' +
+            'kind it can name.',
+        );
+      }
+      // An adopted or skipped `other` contributes nothing generable, by design.
       continue;
     }
 
-    if (!API_KINDS.has(store.kind)) continue;
+    const entry = datastoreEntry(manifest, store);
+    if (!entry) {
+      fail(
+        `analysis.datastores: the ${store.kind} datastore records planId '${store.planId ?? '(none)'}', ` +
+          'which is not an entry in plan.resources. Without that link the datastore cannot be matched ' +
+          'to its create-or-adopt decision.',
+      );
+    }
+    if (entry.action === 'skip') continue;
 
-    // Find the plan entry naming the concrete resource this store refers to.
-    const entry = (manifest.plan?.resources ?? []).find(
-      (r) => r.action === 'adopt' && arnFor(store.kind, r.identifiers, manifest),
-    );
-    const arn = entry ? arnFor(store.kind, entry.identifiers, manifest) : undefined;
-    if (!arn) continue;
+    if (NETWORK_KINDS.has(store.kind)) {
+      networkDatastores.push(buildNetworkDatastore(manifest, store, entry, environmentFromSsm));
+      continue;
+    }
 
-    apiDatastores.push({
-      id: entry.id,
-      kind: store.kind,
-      resourceArns: arn,
-      actions: store.iamActions?.length ? store.iamActions : DEFAULT_ACTIONS[store.kind],
-    });
+    if (!API_KINDS.has(store.kind)) {
+      fail(`analysis.datastores: kind '${store.kind}' is neither network-reached nor API-reached`);
+    }
+
+    apiDatastores.push(buildApiDatastore(manifest, store, entry, environmentFromSsm));
   }
 
-  return { networkDatastores, apiDatastores };
+  return { networkDatastores, apiDatastores, environmentFromSsm };
+}
+
+/** The plan entry a datastore is linked to. */
+function datastoreEntry(manifest, store) {
+  return store.planId ? resource(manifest, store.planId) : undefined;
+}
+
+/** The port for a network-reached store, from the plan, the engine, or the kind. */
+function portFor(store, ids = {}) {
+  return ids.port ?? ENGINE_PORTS[store.engine] ?? DEFAULT_PORTS[store.kind];
+}
+
+function buildNetworkDatastore(manifest, store, entry, environmentFromSsm) {
+  if (entry.action === 'adopt') {
+    const ids = entry.identifiers ?? {};
+    for (const key of ['securityGroupId', 'endpointAddress']) {
+      if (!ids[key]) {
+        fail(
+          `plan.resources: entry '${entry.id}' is marked adopt for a ${store.kind} datastore but ` +
+            `records no ${key}. Without it the generated stack cannot reach the datastore, and the ` +
+            'application fails at startup with a connection timeout rather than a clear error.',
+        );
+      }
+    }
+    return {
+      id: entry.id,
+      mode: 'adopt',
+      kind: store.kind,
+      securityGroupId: ids.securityGroupId,
+      port: portFor(store, ids),
+      endpointAddress: ids.endpointAddress,
+    };
+  }
+
+  if (store.kind === 'rds' && store.engine?.startsWith('aurora')) {
+    fail(
+      `plan.resources: entry '${entry.id}' is marked create for engine '${store.engine}'. An Aurora ` +
+        "cluster's writer and reader topology is not derivable from application code, and a " +
+        'single-instance cluster misrepresents it — an Aurora engine can only be adopted.',
+    );
+  }
+
+  const params = entry.parameters ?? {};
+  const require = (...keys) => {
+    const missing = keys.filter((k) => params[k] === undefined);
+    if (missing.length) {
+      fail(
+        `plan.resources: entry '${entry.id}' is marked create for a ${store.kind} datastore but ` +
+          `records no [${missing.join(', ')}] in parameters. These carry a standing cost or a ` +
+          'durability consequence, so they are asked rather than defaulted.',
+      );
+    }
+  };
+
+  const port = portFor(store, params);
+  const common = {
+    id: entry.id,
+    mode: 'create',
+    kind: store.kind,
+    endpointParameter: `${entry.id}-endpoint`,
+    portParameter: `${entry.id}-port`,
+    port,
+  };
+
+  // Variables the application reads for this datastore that are served from SSM rather
+  // than from the credentials secret — a cache endpoint, typically, since ElastiCache
+  // has no generated secret to read a host out of.
+  const fromSsm = (variables) => {
+    for (const variable of variables) {
+      if (variable.field === 'host') environmentFromSsm[variable.name] = common.endpointParameter;
+      else if (variable.field === 'port') environmentFromSsm[variable.name] = common.portParameter;
+    }
+  };
+
+  // Host and port come from the published parameters for every created kind, not just
+  // the ones with no secret: the endpoint is a deploy-time value either way, and the
+  // secret's `host` field is only populated for engines that report one.
+  fromSsm(store.connection?.variables ?? []);
+
+  if (store.kind === 'elasticache') {
+    require('nodeType', 'engine');
+    return {
+      ...common,
+      engine: params.engine,
+      nodeType: params.nodeType,
+      ...(params.replicaCount === undefined ? {} : { replicaCount: params.replicaCount }),
+    };
+  }
+
+  const credentials = buildDatabaseCredentials(manifest, store, entry);
+
+  if (store.kind === 'documentdb') {
+    require('instanceClass', 'instanceCount');
+    return {
+      ...common,
+      instanceClass: params.instanceClass,
+      instanceCount: params.instanceCount,
+      credentials,
+    };
+  }
+
+  require('instanceClass', 'engineVersion', 'allocatedStorageGb', 'multiAz');
+  return {
+    ...common,
+    engine: store.engine,
+    engineVersion: params.engineVersion,
+    instanceClass: params.instanceClass,
+    allocatedStorageGb: params.allocatedStorageGb,
+    multiAz: params.multiAz,
+    credentials,
+  };
+}
+
+/**
+ * How a created database's generated credentials reach the container.
+ *
+ * A generated secret holds host, port, username, password and dbname. It does not hold
+ * an assembled connection URL, and composing one would mean reading the password to
+ * build it — so an application that reads a single `DATABASE_URL` cannot be served from
+ * here. That case is not silently approximated by injecting five variables the
+ * application never reads: it stops, and names the two things that would resolve it.
+ */
+function buildDatabaseCredentials(manifest, store, entry) {
+  const style = store.connection?.style?.value;
+  if (!style) {
+    fail(
+      `plan.resources: entry '${entry.id}' is marked create for a ${store.kind} datastore but the ` +
+        'analysis records no connection style. Whether the application reads discrete fields or a ' +
+        'single URL decides whether a generated secret can serve it at all.',
+    );
+  }
+
+  const variables = store.connection.variables ?? [];
+
+  if (style === 'url') {
+    const named = new Set(
+      (manifest.analysis?.config?.secrets ?? []).filter((s) => s.arn).map((s) => s.name),
+    );
+    const uncovered = variables.map((v) => v.name).filter((name) => !named.has(name));
+    if (uncovered.length) {
+      fail(
+        `plan.resources: entry '${entry.id}' is marked create, but the application reads ` +
+          `[${uncovered.join(', ')}] as a single connection URL and a generated secret cannot supply ` +
+          'one. Either record an existing secret holding the URL for each of those variables — the ' +
+          'database is still created — or record connection.style "fields" and adapt the application ' +
+          'to read the discrete fields.',
+      );
+    }
+    // The URL comes from an adopted secret in analysis.config.secrets, which is
+    // projected like any other. Nothing is injected from the generated one.
+    return { secretArnParameter: `${entry.id}-secret-arn`, fields: {} };
+  }
+
+  const fields = {};
+  for (const variable of variables) {
+    // host and port are served from the published parameters instead — see fromSsm.
+    if (!variable.field || variable.field === 'host' || variable.field === 'port') continue;
+    fields[variable.name] = variable.field;
+  }
+  return { secretArnParameter: `${entry.id}-secret-arn`, fields };
+}
+
+function buildApiDatastore(manifest, store, entry, environmentFromSsm) {
+  const actions = store.iamActions?.length ? store.iamActions : DEFAULT_ACTIONS[store.kind];
+
+  if (entry.action === 'adopt') {
+    const arns = arnFor(store.kind, entry.identifiers, manifest);
+    if (!arns) {
+      fail(
+        `plan.resources: entry '${entry.id}' is marked adopt for a ${store.kind} datastore but its ` +
+          'identifiers do not name the resource — expected ' +
+          `${ADOPT_IDENTIFIER[store.kind]}. Without it the task role has nothing to be scoped to.`,
+      );
+    }
+    return { id: entry.id, mode: 'adopt', kind: store.kind, resourceArns: arns, actions };
+  }
+
+  const attributeParameter = `${entry.id}-${ATTRIBUTE_PARAMETER[store.kind]}`;
+  for (const variable of store.attributeVariables ?? []) {
+    environmentFromSsm[variable.name] = attributeParameter;
+  }
+
+  const created = { id: entry.id, mode: 'create', kind: store.kind, actions, attributeParameter };
+
+  if (store.kind !== 'dynamodb') return created;
+
+  const pk = store.schema?.partitionKey;
+  if (!pk) {
+    fail(
+      `plan.resources: entry '${entry.id}' is marked create for a DynamoDB table but the analysis ` +
+        "records no key schema. A table's key schema is immutable, so a table created on a guess is " +
+        'deleted and rebuilt rather than altered.',
+    );
+  }
+  if (pk.confidence !== 'high' && !pk.confirmedByUser) {
+    fail(
+      `plan.resources: entry '${entry.id}' is marked create for a DynamoDB table whose partition key ` +
+        `is '${pk.confidence}' confidence and unconfirmed. A table's key schema is immutable, so this ` +
+        'one has to be asked about rather than defaulted.',
+    );
+  }
+
+  return {
+    ...created,
+    partitionKey: pk.value,
+    ...(store.schema.sortKey ? { sortKey: store.schema.sortKey.value } : {}),
+    ...(store.schema.indexes?.length ? { indexes: store.schema.indexes } : {}),
+  };
 }
 
 /** Concrete ARNs per API-reached kind. Never wildcards. */
@@ -234,7 +474,7 @@ function buildPipeline(manifest) {
 function buildConfig(manifest) {
   const { analysis, app, target } = manifest;
   const health = analysis.container.healthCheck;
-  const { networkDatastores, apiDatastores } = buildDatastores(manifest);
+  const { networkDatastores, apiDatastores, environmentFromSsm } = buildDatastores(manifest);
 
   const awsServices = new Set(analysis.egress.awsServices ?? []);
   // ECR image layers live in S3, so the gateway endpoint is required even for an app
@@ -246,6 +486,16 @@ function buildConfig(manifest) {
     awsServices.add('secretsmanager');
   }
   if (analysis.config?.secrets?.some((s) => s.source === 'ssm')) awsServices.add('ssm');
+  // A created database generates its own secret, which the ECS agent fetches through the
+  // task's own network interface on Fargate. An isolated workload that previously needed
+  // no Secrets Manager endpoint needs one now, and without it the task cannot start —
+  // with an error naming Secrets Manager rather than the database.
+  if (networkDatastores.some((d) => d.mode === 'create' && d.credentials)) {
+    awsServices.add('secretsmanager');
+  }
+  // The service stack reads created datastore attributes from Parameter Store, but that
+  // read is CloudFormation's at deploy time rather than the task's, so it adds no
+  // endpoint requirement of its own.
 
   const lbEntry = resource(manifest, 'load-balancer');
 
@@ -291,6 +541,9 @@ function buildConfig(manifest) {
     environment: Object.fromEntries(
       (analysis.config?.environment ?? []).map((e) => [e.name, e.value]),
     ),
+    // Variables whose values are published SSM parameters: a created resource's
+    // physical id is a deploy-time value, so it cannot be a literal above.
+    environmentFromSsm,
     secrets: (analysis.config?.secrets ?? []).map((s) => ({
       name: s.name,
       source: s.source,

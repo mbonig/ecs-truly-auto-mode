@@ -151,32 +151,110 @@ retention, which is a real and permanent cost.
 
 ## Data
 
+Every datastore entry is decided by **looking first**: one targeted lookup on the name
+the analysis recorded, then a question only if the lookup matched nothing or could not
+run. The procedure and its per-kind commands are in
+[adopt-validation.md](./adopt-validation.md#datastores-discovery-then-the-decision). A
+lookup that could not run is never read as absence.
+
+Created datastores carry their chosen shape in **`parameters`**, never `identifiers`.
+Those two fields are mirror images — `identifiers` says what to import, `parameters` says
+what to build — and the validator rejects each on the wrong action, because a value in
+the wrong one applies to nothing at all.
+
+Created datastores are also **retained on stack deletion**, and databases are
+deletion-protected. Say so in the plan. The asymmetry is what makes this the default: a
+retained resource costs money and can be deleted by hand in a minute, while a destroyed
+one is gone.
+
 ### `database`
 
-**Included:** when a network-reached datastore is detected.
-**Action:** `adopt` only. **The skill never creates a database.** A database outlives
-the service by years, and creating one as a side effect of deploying an app is the
-wrong default. If the user has none, say it must exist first.
+**Included:** when a relational or document datastore is detected.
 **Adopt identifiers:** `dbInstanceIdentifier`, `endpointAddress`, `port`,
 `securityGroupId`.
+**Create parameters:** `instanceClass`, `engineVersion`, `allocatedStorageGb`, `multiAz`
+— all **asked**, with a stated default, because each carries a standing monthly cost.
+DocumentDB takes `instanceClass` and `instanceCount` instead.
 
-Generating a security group rule from the task group to `securityGroupId` is the
-piece most often missed. Without it, the app fails at startup with a connection
-timeout rather than a clear error.
+Generating a security group rule from the task group to the database is the piece most
+often missed. Without it, the app fails at startup with a connection timeout rather than
+a clear error. On the adopt path that rule is added to `securityGroupId`; on the create
+path the stack owns the group and there is nothing of anyone else's to touch.
+
+Two things to state when offering `create`, because both surprise people:
+
+- The **first platform deploy blocks for tens of minutes** while the instance is
+  provisioned. It is not a hang. It lands once, since the platform stack is the
+  rarely-deployed one.
+- The database comes up **empty**. Schema migrations are not generated, so a repository
+  with a `migrations/` directory still needs a step this skill does not write.
+
+`create` is **not** offered in two cases: an `aurora-*` engine, whose writer/reader
+topology is not derivable from application code, and an application that reads a single
+URL-shaped connection variable — see below.
+
+**The credential shape gates the create path.** A created database's credentials are
+generated, and a generated secret holds `host`, `port`, `username`, `password` and
+`dbname` — not an assembled URL. So when the analysis recorded `connection.style: url`
+(`DATABASE_URL`, `MONGO_URI`), the entry stays **incomplete** until the user picks one of:
+
+1. Supply an existing secret holding the URL. The database is still created; the secret
+   is injected by reference like any other.
+2. Switch to the discrete variables and adapt the application.
+
+Do not resolve this by injecting five fields the application will never read, and do not
+quietly fall back to `adopt`.
 
 ### `cache`
 
-Same treatment as `database`. Adopt-only. Identifiers: `cacheClusterId`,
-`endpointAddress`, `port`, `securityGroupId`.
+**Included:** when ElastiCache is detected.
+**Adopt identifiers:** `cacheClusterId`, `endpointAddress`, `port`, `securityGroupId`.
+**Create parameters:** `nodeType` and `engine` (`redis` or `memcached`), plus
+`replicaCount` for Redis — asked, for the same cost reason.
+
+ElastiCache has no generated secret, so a created cluster's endpoint and port are
+published as parameters and the application's host and port variables are injected from
+those. In-transit encryption is left off deliberately: it requires the client to connect
+over TLS, so enabling it silently would break a client that connects in plaintext.
+
+This is the one datastore built from L1 constructs — aws-cdk-lib ships no L2 for
+ElastiCache — which is worth knowing when reading the generated stack.
 
 ### Bucket, table, queue, topic entries
 
 **Included:** one entry per API-reached resource detected.
-**Action:** `adopt` by default — these usually exist and are shared. `create` is
-offered when the analysis found a name that resolves to nothing.
 **Adopt identifiers:** `bucketName`, `tableName`, `queueUrl`, `topicArn` respectively.
+**Create parameters:** none are asked. A bucket, queue and topic have no cost knob worth
+a question, so their shape is fixed and *stated*:
 
-The `id` is derived from the resource's role: `receipts-bucket`, `sessions-table`.
+| | Fixed shape |
+| --- | --- |
+| Bucket | SSE-S3, all public access blocked, TLS enforced, versioned |
+| Queue | dead-letter queue at 5 receives — without one, unprocessable messages vanish |
+| Topic | nothing but a name |
+| Table | on-demand billing, point-in-time recovery on |
+
+**A created table is the exception, and the strictest entry in this catalog.** Its key
+schema comes from the analysis, and `create` requires it at `high` confidence or
+confirmed by the user — there is no default at any confidence level. A table's key schema
+is immutable, so a wrong partition key is fixed by deleting and rebuilding a table that
+may by then hold data. This is the only datastore decision that cannot be corrected after
+the fact.
+
+The `id` is derived from the resource's role: `receipts-bucket`, `sessions-table`. Each
+datastore's `planId` names the entry it belongs to — without that link a created resource
+cannot be matched to its decision, since it has no identifiers to match on.
+
+A created resource's physical name is a **deploy-time value**, so the analysis must have
+recorded the environment variable that carries it. The platform stack publishes the name
+and the service stack injects it; with no variable recorded, the resource is created and
+the container has no way to address it.
+
+### Datastores that can only be adopted
+
+Kind `other` — a datastore the analysis could not identify. The skill cannot create a
+resource it could not name. Say that rather than presenting a create option that would
+fail.
 
 ## Pipeline
 
@@ -243,12 +321,22 @@ finished by CloudFormation. Ask for the ARN of a connection already in `AVAILABL
 1. Start with the always-included entries.
 2. Add ingress entries if the container accepts traffic.
 3. Add `certificate`, `hosted-zone`, `dns-record` if a public hostname is recorded.
-4. Add one entry per detected datastore.
+4. Add one entry per detected datastore, each linked by the datastore's `planId`.
 5. Add the pipeline entries for the selected target.
-6. Set `nat-gateway` and `vpc-endpoints` from the egress classification.
-7. For each entry, ask create-or-adopt — except where this catalog says the action is
-   derived (`nat-gateway`) or adoption is the only option (`database`, `cache`,
-   `hosted-zone`, `codeconnection`).
+6. Set `nat-gateway` from the egress classification.
+7. For each entry, ask create-or-adopt — **after** running the lookup that decides it,
+   where one applies. Except where this catalog says the action is derived
+   (`nat-gateway`) or adoption is the only option (`hosted-zone`, `codeconnection`, and a
+   datastore of kind `other`).
+8. **Now** set `vpc-endpoints` — after the datastore decisions, not from the egress
+   classification alone.
+
+Step 8 is last for a reason. A *created* database generates its own credentials secret,
+and on Fargate the ECS agent fetches secrets through the task's own network interface. So
+an `egress: none` workload that previously needed no Secrets Manager endpoint needs one
+the moment the database becomes `create`. Fix the endpoint set before that decision and
+the result is a task that cannot start, reporting an error that names Secrets Manager
+rather than the database.
 
 Every entry needs a `reason` naming what put it in the plan. An entry the user cannot
 account for is one they cannot evaluate.

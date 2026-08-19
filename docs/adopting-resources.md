@@ -20,9 +20,9 @@ environment-dependent and write a `cdk.context.json` that goes stale.
 | `target-group` | `targetGroupArn` |
 | `certificate` | `certificateArn` (same region as the ALB) — or create it, see below |
 | `hosted-zone` | `hostedZoneId`, `zoneName` |
-| `database` | `dbInstanceIdentifier`, `endpointAddress`, `port`, `securityGroupId` |
-| `cache` | `cacheClusterId`, `endpointAddress`, `port`, `securityGroupId` |
-| Buckets / tables / queues / topics | `bucketName` / `tableName` / `queueUrl` / `topicArn` |
+| `database` (RDS or DocumentDB) | `dbInstanceIdentifier`, `endpointAddress`, `port`, `securityGroupId` — or create it, see below |
+| `cache` (ElastiCache) | `cacheClusterId`, `endpointAddress`, `port`, `securityGroupId` — or create it |
+| Buckets / tables / queues / topics | `bucketName` / `tableName` / `queueUrl` / `topicArn` — or create them |
 | `github-oidc-role` | `roleArn` |
 | `github-oidc-provider` | `providerArn` |
 | `codeconnection` | `connectionArn` (must already be `AVAILABLE`) |
@@ -57,19 +57,68 @@ one", because those two situations need opposite actions.
 An adopted provider is used as-is. Its thumbprints and client IDs stay yours; the skill
 only reads the ARN.
 
+## Datastores: the skill looks before it asks
+
+Datastores work the same way the OIDC provider does. For each one it detects, the skill
+runs a single lookup on whatever name it found in your code — a table name, a bucket
+name, the first label of an `*.rds.amazonaws.com` host:
+
+- **Found it** → adopted, identifiers filled in from the response. You are not asked.
+- **Checked and it isn't there** → offered as `create`.
+- **Couldn't check** → you are asked, with both options. A lookup that failed is never
+  read as "it doesn't exist", because those two situations need opposite actions.
+- **No name to look up** → you are asked. The skill does not enumerate every table in
+  your account to fill the gap.
+
+### What a created datastore commits you to
+
+Creating is a real option now, but it is not free of consequences, and the plan states
+all of these before you approve it:
+
+- **Created datastores are retained on stack deletion**, and databases are
+  deletion-protected. `cdk destroy` leaves them — and their bill — behind. This is
+  deliberate: a retained resource costs money and takes a minute to delete by hand, while
+  a destroyed one is gone.
+- **A created database's first platform deploy takes tens of minutes.** It is not a
+  hang. It happens once, since the platform stack is the rarely-deployed one.
+- **A created database comes up empty.** Schema migrations are yours — the skill does not
+  generate them and the pipeline does not run them.
+- **A created table's key schema cannot be changed.** So the skill refuses to create one
+  unless the key schema was read from your code at high confidence or you confirmed it.
+  This is the only datastore decision that cannot be revised later.
+
+### If your app reads a single DATABASE_URL
+
+This is the common case, and the one place a `create` decision cannot complete on its own.
+
+A created database gets generated credentials in Secrets Manager, holding `host`, `port`,
+`username`, `password` and `dbname` as separate fields. It does not hold an assembled
+connection URL, and nothing can build one without reading the password to do it. So if
+your application reads `DATABASE_URL` (or `REDIS_URL`, or `MONGO_URI`), the plan will stop
+and offer you two ways forward:
+
+1. **Give it a secret holding the URL.** The database is still created; your secret is
+   injected by reference like any other.
+2. **Switch to the discrete variables** — `PGHOST`, `PGUSER`, and so on — and adapt the
+   application.
+
+It will not guess, and it will not quietly fall back to making you find a database.
+
 ## Resources that can only be adopted
 
 Some things the skill will never create, and the reasons differ:
 
-- **Databases and caches.** A database outlives the service by years. Creating one as
-  a side effect of deploying an app is the wrong default, so if you don't have one
-  yet, it has to exist before the plan can complete. The skill wires connectivity and
-  credentials to it and never touches the database itself.
 - **Hosted zones.** Creating one means delegating nameservers at a registrar, which
   is outside what the skill can verify.
 - **CodeConnections connections.** A new connection is created in `PENDING` and
   requires a human to complete an OAuth handshake in the console. CloudFormation
   cannot finish it.
+- **Aurora clusters.** A cluster's writer/reader topology is not something the skill can
+  read out of your application code, and creating a one-instance cluster would
+  misrepresent what Aurora is for. A plain RDS engine can be created; `aurora-*` is
+  adopt-only.
+- **A datastore it could not identify.** If the analysis records a datastore as `other`,
+  it cannot create it — it does not know what to make.
 
 ## Validation
 

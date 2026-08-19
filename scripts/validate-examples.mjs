@@ -252,6 +252,96 @@ const corruptions = [
     },
     expect: 'would never issue',
   },
+
+  //
+  // Datastores. The create half of the create-or-adopt decision, where the failure
+  // mode is a plan that generates an application pointed at something that was never
+  // made — see openspec/changes/create-or-adopt-datastores.
+  //
+  {
+    // The common case: an application that reads a single DATABASE_URL cannot be
+    // served by a generated secret, which holds fields and no assembled URL.
+    name: 'created database whose application reads a single connection URL',
+    base: 'created-datastores',
+    break: (m) => {
+      const rds = m.analysis.datastores.find((d) => d.kind === 'rds');
+      rds.connection.style.value = 'url';
+      rds.connection.variables = [{ name: 'DATABASE_URL' }];
+    },
+    expect: 'a generated secret cannot supply one',
+  },
+  {
+    name: 'created table whose partition key is unconfirmed',
+    base: 'created-datastores',
+    break: (m) => {
+      const table = m.analysis.datastores.find((d) => d.kind === 'dynamodb');
+      table.schema.partitionKey.confidence = 'medium';
+      table.schema.partitionKey.confirmedByUser = true;
+      // Keep the *plan* approvable so the failure is attributable to the create
+      // decision rather than to the unconfirmed-findings check.
+      delete table.schema.partitionKey.confirmedByUser;
+      table.schema.sortKey.confidence = 'medium';
+      table.schema.sortKey.confirmedByUser = true;
+    },
+    expect: 'key schema is immutable',
+  },
+  {
+    name: 'created datastore carrying adopt identifiers instead of parameters',
+    base: 'created-datastores',
+    break: (m) => {
+      m.plan.resources.find((r) => r.id === 'database').identifiers = {
+        dbInstanceIdentifier: 'ledger-prod',
+      };
+    },
+    expect: 'only an adopted resource is imported',
+  },
+  {
+    name: 'adopted datastore carrying create parameters',
+    base: 'created-datastores',
+    break: (m) => {
+      const entry = m.plan.resources.find((r) => r.id === 'entries-table');
+      entry.action = 'adopt';
+      entry.identifiers = { tableName: 'ledger-entries' };
+      entry.parameters = { billingMode: 'PROVISIONED' };
+    },
+    expect: 'only a created resource is built to a chosen shape',
+  },
+  {
+    name: 'created database missing the parameters that carry a cost',
+    base: 'created-datastores',
+    break: (m) => {
+      delete m.plan.resources.find((r) => r.id === 'database').parameters.instanceClass;
+    },
+    expect: 'asked rather than defaulted',
+  },
+  {
+    // "The check failed" and "there is no provider/table/instance" need opposite
+    // actions — the same reasoning the OIDC provider entry above encodes.
+    name: 'isolated workload creating a database with no secrets endpoint',
+    base: 'created-datastores',
+    break: (m) => {
+      m.analysis.egress.awsServices = m.analysis.egress.awsServices.filter(
+        (s) => s !== 'secretsmanager',
+      );
+    },
+    expect: 'cannot start',
+  },
+  {
+    name: 'created Aurora engine',
+    base: 'created-datastores',
+    break: (m) => {
+      m.analysis.datastores.find((d) => d.kind === 'rds').engine = 'aurora-postgresql';
+    },
+    expect: 'can only be adopted',
+  },
+  {
+    name: 'datastore with no link to a plan entry',
+    base: 'created-datastores',
+    break: (m) => {
+      delete m.analysis.datastores.find((d) => d.kind === 'dynamodb').planId;
+    },
+    expect: 'records no planId',
+  },
 ];
 
 function main() {

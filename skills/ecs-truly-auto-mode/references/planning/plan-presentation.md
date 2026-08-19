@@ -43,10 +43,18 @@ Not alphabetical, not by resource type. Ordered by what it costs to get wrong:
   hosted-zone     The public zone for example.com
                   Need: hosted zone ID
 
-### Datastores (2)
+### Datastores (3)
 
-  RDS Postgres    adopt  — security group rule + credentials secret
-  S3 receipts     adopt  — s3:PutObject, s3:GetObject on orders-receipts-prod
+  RDS Postgres    adopt  — orders-prod, found in the account
+                  Security group rule + credentials secret
+
+  S3 receipts     adopt  — orders-receipts-prod, found in the account
+                  s3:PutObject, s3:GetObject
+
+  sessions-table  CREATE — no table named in app/sessions.py exists in this account
+                  Key: sessionId (S)  — from app/sessions.py:14, confirmed
+                  On-demand billing, PITR on
+                  Retained on stack deletion
 
 ### Inbound
 
@@ -66,6 +74,44 @@ Not alphabetical, not by resource type. Ordered by what it costs to get wrong:
 
   Pipeline    GitHub Actions, on push to main
   Infra app   plain CDK  (projen is the alternative -- same stacks either way)
+```
+
+## Presenting a created datastore
+
+A created datastore needs three things said that an adopted one does not, because each is
+a commitment the user cannot see from the entry alone:
+
+1. **Why it is `create`.** Name the lookup: "no table of that name exists in this
+   account". A `create` that reads as a default invites the user to wonder what was
+   checked. If the lookup could not run, say *that* instead — and offer both actions.
+2. **The shape, and where it came from.** Which values were asked, which were derived
+   from the code (with the `file:line`), and which are fixed. A created table's key
+   schema is worth showing in full: it is immutable, so it is the one datastore value the
+   user cannot revise later.
+3. **What it leaves behind.** Retained on stack deletion, and deletion-protected for a
+   database. Add the **first-deploy duration** for a relational or document database —
+   tens of minutes, which reads as a hang if unsaid — and that the database comes up
+   **empty**, so migrations are still the user's.
+
+Do not steer toward `adopt`. Both actions are real, and a datastore the account does not
+have is an ordinary answer rather than a blocked run.
+
+The one case that is genuinely blocked: a `create` decision on a database whose
+application reads a single URL-shaped variable. Say what is missing and name both
+resolutions, rather than falling back to `adopt` or injecting fields nothing reads:
+
+```
+  database        CREATE — but incomplete
+
+                  app/db.py:8 reads DATABASE_URL as a single connection string.
+                  A generated secret holds host, port, username, password and
+                  dbname — it cannot hold an assembled URL, and composing one
+                  would mean reading the password.
+
+                  Pick one:
+                    1  Give me a secret ARN holding the URL. The database is
+                       still created; the secret is injected by reference.
+                    2  Switch to discrete PGHOST/PGUSER/... and adapt the app.
 ```
 
 ## The egress headline

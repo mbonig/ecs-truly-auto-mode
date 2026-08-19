@@ -118,6 +118,28 @@ If credentials are available and a previously-validated resource has since been
 deleted, that is worth catching — but it is a `--refresh`-style explicit action, not
 something to do on every run.
 
+## Created datastores
+
+A datastore the manifest records as `create` has, after the first deploy, a real resource
+behind it. On a re-run, **report drift; do not correct it.**
+
+If the recorded `parameters` no longer match the live resource — someone resized the
+instance, changed the node type, added an index — say so, and leave the manifest as the
+record of what was asked for. Do not resize it back. A stateful resource that another
+person deliberately changed is not drift to reconcile, and a re-plan that silently
+reverts a production instance class is a far worse outcome than a stale parameter.
+
+Two exceptions worth flagging rather than editing:
+
+- **The resource is gone.** A retained resource that was deleted by hand means the next
+  deploy recreates it — empty. Say that plainly; it is the one drift with data loss on the
+  other side of it.
+- **A created table's key schema no longer matches.** It cannot have changed, so this
+  means the recorded schema was wrong or the table was rebuilt. Ask; do not reconcile.
+
+A datastore whose action changes between runs — `adopt` to `create` or back — is a
+decision, not a diff. Present it as a question with what the lookup found.
+
 ## Presenting no change
 
 The common case, and it should be brief:

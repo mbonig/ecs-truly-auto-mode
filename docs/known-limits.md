@@ -38,6 +38,22 @@ recognize, or a driver is a transitive dependency that doesn't look load-bearing
 an "I use one that isn't listed" option. An app with no detected datastore is
 reported as *appearing* stateless and asked about — silence is not confirmation.
 
+### A created database whose app reads a single connection URL
+
+**Symptom:** the plan reports the datastore entry as incomplete and refuses to finish.
+
+**Why it happens:** a created database's credentials are generated, and a generated secret
+holds `host`, `port`, `username`, `password` and `dbname` as separate fields. It cannot
+hold an assembled `DATABASE_URL`, and composing one would mean reading the password to
+build it. `DATABASE_URL` is the common shape, so this comes up on most first runs against
+a database that does not exist yet.
+
+**Mitigation:** this one is deliberately not mitigated — it is surfaced. The plan names
+both resolutions: supply an existing secret holding the URL (the database is still
+created), or switch the application to the discrete variables. It will not inject five
+variables an application that reads one will never look at, and it will not fall back to
+adopt-only.
+
 ### An unrecognized ecosystem
 
 Node, Python, Go, Java and Ruby have checklists. Anything else falls back to a
@@ -60,8 +76,19 @@ Not covered, and not planned:
   (Sidekiq, Celery, an SQS consumer) needs two task definitions. The skill flags this
   and asks rather than silently deploying only the web process.
 - **Fixing a Dockerfile that doesn't build.** The run stops and reports.
-- **Creating databases, caches, hosted zones, or secrets.** All adopt-only, for
-  reasons in [adopting resources](./adopting-resources.md).
+- **Creating hosted zones or secrets, and Aurora clusters.** Adopt-only, for reasons in
+  [adopting resources](./adopting-resources.md). Databases, caches, tables, buckets,
+  queues and topics *can* be created — with the limits below.
+- **Schema migrations.** A created database comes up empty. The skill does not generate a
+  migration step and the pipeline does not run one, so a repository with a `migrations/`
+  directory still needs that wired up. This is the gap between a deploy that succeeds and
+  an application that works.
+- **Resizing a created datastore on a re-run.** Re-planning *reports* drift between the
+  recorded parameters and the live resource; it does not correct it. A stateful resource
+  somebody deliberately resized is not drift to reconcile, and silently reverting a
+  production instance class would be worse than a stale parameter.
+- **A datastore the analysis could not identify.** Recorded as kind `other` and
+  adopt-only — the skill cannot create what it cannot name.
 - **`--target` multi-stage builds.** The final stage is assumed to be the last
   `FROM`.
 - **Converting a generated app between project styles.** Choosing `projen` on a
@@ -126,8 +153,12 @@ bug and is not.
 ## Security posture
 
 - Secret **values** are never read or recorded. Only names and pointers.
-- Task roles get exact resource ARNs, never wildcards. If the resources can't be
-  determined, the plan asks instead of over-granting.
+- Task roles get exact resource ARNs, never wildcards — for created resources as well as
+  adopted ones. If the resources can't be determined, the plan asks instead of
+  over-granting.
+- A created database's credentials are generated in Secrets Manager and never pass
+  through a template. The stack that owns the secret grants the execution role read on
+  **that secret alone**, so no wildcard grant is written and no ARN has to be supplied.
 - The GitHub OIDC trust policy is scoped to `repo:<owner>/<repo>:*`. Without that
   condition it could be assumed from any repository on GitHub — an account
   compromise, not a misconfiguration.

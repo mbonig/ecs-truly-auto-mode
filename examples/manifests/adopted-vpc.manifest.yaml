@@ -93,6 +93,7 @@ analysis:
   datastores:
     - kind: rds
       engine: postgres
+      planId: database
       confidence: high
       evidence:
         - file: app/db.py
@@ -105,6 +106,7 @@ analysis:
           excerpt: 'asyncpg = "^0.30"'
       iamActions: []
     - kind: s3
+      planId: receipts-bucket
       confidence: high
       evidence:
         - file: app/receipts.py
